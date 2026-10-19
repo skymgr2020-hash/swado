@@ -1,0 +1,219 @@
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+
+class DriverGig extends Model
+{
+    protected $appends = [
+        'duration',
+        'estimated_earning',
+        'projected_orders_per_driver',
+        'date_short',
+        'slot_start_local',
+        'slot_end_local',
+        'time_range',
+        'booked_count',
+        'available_seats',
+    ];
+
+    protected $fillable = [
+        'title',
+        'description',
+        'driver_id',
+        'area_id',
+        'branch_id',
+        'open_to_pool',
+        'capacity',
+        'date',
+        'start_time',
+        'end_time',
+        'status',
+        'earnings',
+        'orders_count',
+        'forecast_meta',
+        'auto_pricing_enabled',
+        'surge_multiplier',
+        'demand_score',
+        'recommended_capacity',
+        'forecasted_orders',
+        'base_pay',
+        'order_incentive',
+        'login_incentive',
+        'min_orders_required',
+        'min_login_minutes',
+        'max_cancellations_allowed',
+        'terms_conditions',
+        'booked_at',
+    ];
+    
+    protected $casts = [
+        'date' => 'date',
+        'start_time' => 'datetime',
+        'end_time' => 'datetime',
+        'earnings' => 'integer',
+        'orders_count' => 'integer',
+        'recommended_capacity' => 'integer',
+        'auto_pricing_enabled' => 'boolean',
+        'open_to_pool' => 'boolean',
+        'forecast_meta' => 'array',
+        'forecasted_orders' => 'integer',
+        'surge_multiplier' => 'decimal:2',
+        'demand_score' => 'decimal:2',
+        'capacity' => 'integer',
+        'base_pay' => 'decimal:2',
+        'order_incentive' => 'decimal:2',
+        'login_incentive' => 'decimal:2',
+        'min_orders_required' => 'integer',
+        'min_login_minutes' => 'integer',
+        'max_cancellations_allowed' => 'integer',
+        'booked_at' => 'datetime',
+    ];
+    
+    public function driver(): BelongsTo
+    {
+        return $this->belongsTo(User::class, 'driver_id');
+    }
+    
+    public function area(): BelongsTo
+    {
+        return $this->belongsTo(DeliveryArea::class, 'area_id');
+    }
+
+    public function branch(): BelongsTo
+    {
+        return $this->belongsTo(Branch::class);
+    }
+
+    /**
+     * Whether a driver from outside this gig's own branch may book it. A
+     * platform-wide (admin-created, branch_id null) gig is always bookable by
+     * anyone; a branch-created gig only opens up when it explicitly opts in.
+     */
+    public function isBookableByBranch(?int $driverBranchId): bool
+    {
+        if (! $this->branch_id) {
+            return true;
+        }
+
+        return $this->open_to_pool || (int) $this->branch_id === (int) $driverBranchId;
+    }
+
+    public function bookings(): HasMany
+    {
+        return $this->hasMany(DriverGigBooking::class, 'driver_gig_id');
+    }
+
+    public function activeBookings(): HasMany
+    {
+        return $this->bookings()->whereIn('status', ['booked', 'completed']);
+    }
+    
+    public function getDurationAttribute(): string
+    {
+        return $this->time_range;
+    }
+
+    /**
+     * What a driver on this slot can realistically expect to earn -- base pay
+     * + order incentive for the number of orders the demand forecast projects
+     * for one driver in this slot (not just the bare min_orders_required
+     * threshold, which understates a busy slot) + login incentive, lifted by
+     * the slot's surge multiplier the same way App\Services\GigIncentiveService
+     * pays it out. Falls back to min_orders_required when there is no forecast.
+     */
+    public function getEstimatedEarningAttribute(): float
+    {
+        $subtotal = (float) $this->base_pay
+            + ((float) $this->order_incentive * $this->projectedOrdersPerDriver())
+            + (float) $this->login_incentive;
+
+        $surge = max(1.0, (float) ($this->surge_multiplier ?? 1));
+
+        return round($subtotal * $surge, 2);
+    }
+
+    public function getProjectedOrdersPerDriverAttribute(): int
+    {
+        return $this->projectedOrdersPerDriver();
+    }
+
+    private function projectedOrdersPerDriver(): int
+    {
+        $minOrders = max(0, (int) $this->min_orders_required);
+        $forecast = (int) $this->forecasted_orders;
+
+        if ($forecast <= 0) {
+            return $minOrders;
+        }
+
+        $slots = (int) ($this->recommended_capacity ?: $this->capacity);
+        $slots = max(1, $slots);
+
+        return max($minOrders, (int) ceil($forecast / $slots));
+    }
+
+    public function getBookedCountAttribute(): int
+    {
+        if (array_key_exists('active_bookings_count', $this->attributes)) {
+            return (int) $this->attributes['active_bookings_count'];
+        }
+
+        if ($this->relationLoaded('activeBookings')) {
+            return $this->activeBookings->count();
+        }
+
+        return $this->activeBookings()->count();
+    }
+
+    public function getAvailableSeatsAttribute(): int
+    {
+        return max(0, (int) $this->capacity - $this->booked_count);
+    }
+
+    public function getDateShortAttribute(): ?string
+    {
+        return $this->date?->format('d M');
+    }
+
+    public function getSlotStartLocalAttribute(): ?string
+    {
+        return $this->localSlotTime('start_time')?->format('Y-m-d H:i:s');
+    }
+
+    public function getSlotEndLocalAttribute(): ?string
+    {
+        return $this->localSlotTime('end_time')?->format('Y-m-d H:i:s');
+    }
+
+    public function getTimeRangeAttribute(): string
+    {
+        $start = $this->localSlotTime('start_time');
+        $end = $this->localSlotTime('end_time');
+
+        if (! $start || ! $end) {
+            return '';
+        }
+
+        return $start->format('h:i A') . ' - ' . $end->format('h:i A');
+    }
+
+    private function localSlotTime(string $attribute): ?\Carbon\Carbon
+    {
+        $date = $this->date;
+        $time = $this->{$attribute};
+
+        if (! $date || ! $time) {
+            return null;
+        }
+
+        return \Carbon\Carbon::createFromFormat(
+            'Y-m-d H:i:s',
+            $date->format('Y-m-d') . ' ' . $time->format('H:i:s'),
+            config('app.timezone')
+        );
+    }
+}

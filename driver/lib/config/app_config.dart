@@ -1,0 +1,71 @@
+// lib/config/app_config.dart
+import 'package:flutter/material.dart';
+
+class AppConfig {
+  static const String appRole = String.fromEnvironment(
+    'APP_ROLE',
+    defaultValue: 'driver',
+  );
+  static const String appPackageName = String.fromEnvironment(
+    'APP_PACKAGE_NAME',
+    defaultValue: 'com.renjo.driver',
+  );
+
+  static const String appName = 'Swado';
+  static const String apiBaseUrl = String.fromEnvironment(
+    'API_BASE_URL',
+    defaultValue: 'https://swado.online/api',
+  );
+  static const String googleMapsApiKey = String.fromEnvironment(
+    'GOOGLE_MAPS_API_KEY',
+    defaultValue: '',
+  );
+  static const Color primaryColor = Color(0xFF2563EB);
+  static const Color secondaryColor = Color(0xFF282C3F);
+  static const Color backgroundColor = Color(0xFFF7F7F7);
+
+  // Firebase Config (if using)
+  static const String firebaseProjectId = String.fromEnvironment(
+    'FIREBASE_PROJECT_ID',
+    defaultValue: 'Swado-458b0',
+  );
+
+  static const String supportPhone = String.fromEnvironment(
+    'SUPPORT_PHONE',
+    defaultValue: '+919279380225',
+  );
+  static const String supportEmail = String.fromEnvironment(
+    'SUPPORT_EMAIL',
+    defaultValue: 'info@swado.online',
+  );
+
+  static const String appsFlyerDevKey = String.fromEnvironment(
+    'APPSFLYER_DEV_KEY',
+    defaultValue: '',
+  );
+  static const String appsFlyerAppId = String.fromEnvironment(
+    'APPSFLYER_APP_ID',
+    defaultValue: '',
+  );
+  static const String appsFlyerOneLinkId = String.fromEnvironment(
+    'APPSFLYER_ONELINK_ID',
+    defaultValue: '',
+  );
+  static const String appsFlyerOneLinkDomain = String.fromEnvironment(
+    'APPSFLYER_ONELINK_DOMAIN',
+    defaultValue: '',
+  );
+  static const String appsFlyerOneLinkPath = String.fromEnvironment(
+    'APPSFLYER_ONELINK_PATH',
+    defaultValue: '',
+  );
+  static const bool appsFlyerDebug = bool.fromEnvironment(
+    'APPSFLYER_DEBUG',
+    defaultValue: false,
+  );
+
+  static bool get isCustomerApp => appRole == 'customer';
+  static bool get isRestaurantApp => appRole == 'restaurant';
+  static bool get isDriverApp => appRole == 'driver';
+  static bool get isRoleLocked => appRole != 'all';
+}

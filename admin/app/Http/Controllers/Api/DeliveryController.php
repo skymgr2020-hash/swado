@@ -1,0 +1,274 @@
+<?php
+
+namespace App\Http\Controllers\Api;
+
+use App\Http\Controllers\Controller;
+use App\Models\Order;
+use App\Models\AppSetting;
+use App\Models\PaymentAttempt;
+use App\Models\Wallet;
+use App\Models\WalletTransaction;
+use App\Services\OrderStatusPushService;
+use App\Services\PayoutCalculationService;
+use App\Services\ScratchCardService;
+use App\Services\SmsService;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
+
+class DeliveryController extends Controller
+{
+    public function verifyOtp(Request $request, PayoutCalculationService $payoutCalculation, $orderId)
+    {
+        $request->validate([
+            'otp' => 'required|string|size:4',
+            'payment_mode' => 'required|in:cash,online',
+            'cash_collected' => 'required_if:payment_mode,cash|boolean',
+        ]);
+        
+        $order = Order::where('driver_id', auth()->id())
+            ->where('status', 'on_the_way')
+            ->findOrFail($orderId);
+
+        if (!$order->delivery_otp || !hash_equals((string) $order->delivery_otp, (string) $request->otp)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Invalid OTP'
+            ], 400);
+        }
+
+        $paymentResult = $this->resolvePayment($order, $request);
+        if (!$paymentResult['success']) {
+            return response()->json([
+                'success' => false,
+                'message' => $paymentResult['message'],
+            ], $paymentResult['status'] ?? 422);
+        }
+
+        DB::transaction(function () use ($order, $request, $payoutCalculation) {
+            $order->status = 'delivered';
+            $order->delivered_at = now();
+            $order->otp_verified = true;
+            $order->otp_verified_at = now();
+
+            // An order that's ALREADY payment_status=success via a REAL
+            // online gateway (customer-app prepaid, or a driver-QR
+            // collection whose webhook already landed) must never be
+            // re-attributed as a cash collection just because the app
+            // happened to submit payment_mode=cash -- that would overwrite
+            // the real payment_method back to 'cod' and wrongly debit the
+            // driver's wallet for cash they never actually held (the
+            // customer paid the gateway directly, not the driver). See
+            // resolvePayment()'s matching guard above -- never trust a
+            // client-submitted value for something the server already
+            // knows authoritatively.
+            //
+            // Critically, payment_status=success is ALSO set by the
+            // driver app's own "Cash collected from customer" button
+            // (OrderPaymentService::markDriverCashReceived(), source
+            // driver_cash) -- a real cash collection that has NOT yet
+            // debited the driver's wallet. A plain payment_status check
+            // can't tell these apart, so branch on payment_source instead:
+            // only customer_app/driver_qr (real gateways) count as
+            // "already paid online". Everything else -- never paid, or
+            // paid via the driver's own cash button -- must still run the
+            // wallet debit below (idempotent, so it's safe even if the
+            // driver-cash endpoint already ran).
+            $alreadyPaidOnline = $order->payment_status === 'success'
+                && $order->payment_source !== PaymentAttempt::SOURCE_DRIVER_CASH;
+            $order->delivery_payment_mode = $alreadyPaidOnline ? 'online' : 'cod';
+
+            if (! $alreadyPaidOnline) {
+                $order->payment_method = 'cod';
+                $order->payment_status = 'success';
+                $order->cash_collected_amount = $order->cash_collected_amount ?: $order->total;
+                $order->cash_collected_at = $order->cash_collected_at ?: now();
+                $this->debitDriverWalletForCodCollection($order);
+            } else {
+                $order->payment_status = 'success';
+                $order->online_payment_verified_at = $order->online_payment_verified_at ?: now();
+            }
+
+            $order->save();
+
+            $payoutCalculation->processOrderEarnings($order->fresh());
+        });
+
+        $this->issueScratchCardsForOrderEvent($order, 'delivery');
+
+        // The driver just completed this — only customer/restaurant get the push.
+        app(OrderStatusPushService::class)->notifyParticipants(
+            $order->fresh(['customer', 'restaurant']),
+            null,
+            ['customer', 'restaurant']
+        );
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Delivery completed and payment confirmed.',
+            'data' => $order->fresh()
+        ]);
+    }
+    
+    public function resendOtp($orderId)
+    {
+        $order = Order::where('driver_id', auth()->id())
+            ->where('status', 'on_the_way')
+            ->findOrFail($orderId);
+            
+        $otp = $order->generateDeliveryOtp();
+
+        try {
+            $sent = app(SmsService::class)->sendDeliveryOtp($order->fresh(['customer', 'restaurant']));
+
+            if (! $sent) {
+                throw new \RuntimeException('SMS message service is not configured.');
+            }
+        } catch (\Throwable $e) {
+            Log::warning('Delivery OTP resend SMS failed.', [
+                'order_id' => $order->id,
+                'message' => $e->getMessage(),
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'message' => 'OTP was regenerated but SMS could not be sent. Please check the configured OTP provider.',
+            ], 502);
+        }
+        
+        return response()->json([
+            'success' => true,
+            'message' => 'OTP resent successfully'
+        ]);
+    }
+
+    private function resolvePayment(Order $order, Request $request): array
+    {
+        // Authoritative check first: if the order is already paid (customer
+        // prepaid, or a driver-QR collection whose webhook already
+        // completed while the driver was mid-delivery), completion just
+        // succeeds regardless of whatever payment_mode the app submits --
+        // see the matching guard in verifyOtp()'s transaction below.
+        if ($order->payment_status === 'success') {
+            return ['success' => true];
+        }
+
+        if ($request->payment_mode === 'cash') {
+            if (!$request->boolean('cash_collected')) {
+                return [
+                    'success' => false,
+                    'message' => 'Confirm cash collection before completing delivery.',
+                    'status' => 422,
+                ];
+            }
+
+            return ['success' => true];
+        }
+
+        if (!$order->payment_id) {
+            return [
+                'success' => false,
+                'message' => 'Online payment is not completed yet. Ask customer to complete payment before delivery.',
+                'status' => 409,
+            ];
+        }
+
+        if (!$this->verifyRazorpayPayment($order)) {
+            return [
+                'success' => false,
+                'message' => 'Razorpay payment is not captured. Please wait for payment completion or collect cash.',
+                'status' => 409,
+            ];
+        }
+
+        return ['success' => true];
+    }
+
+    private function issueScratchCardsForOrderEvent(Order $order, string $event): void
+    {
+        try {
+            app(ScratchCardService::class)->issueForRecordedUsage(
+                $order->fresh(['customer', 'restaurant']),
+                $event
+            );
+        } catch (\Throwable $e) {
+            Log::warning('Scratch card issue failed for delivery order event.', [
+                'order_id' => $order->id,
+                'event' => $event,
+                'message' => $e->getMessage(),
+            ]);
+        }
+    }
+
+    private function verifyRazorpayPayment(Order $order): bool
+    {
+        $key = config('services.razorpay.key');
+        $secret = config('services.razorpay.secret');
+
+        if (!$key || !$secret) {
+            return false;
+        }
+
+        $response = Http::withBasicAuth($key, $secret)
+            ->acceptJson()
+            ->timeout(10)
+            ->get("https://api.razorpay.com/v1/payments/{$order->payment_id}");
+
+        if (!$response->ok()) {
+            return false;
+        }
+
+        $payment = $response->json();
+        $expectedAmount = (int) round(((float) $order->total) * 100);
+
+        $currency = strtoupper(AppSetting::getValue('currency_code', 'INR') ?: 'INR');
+
+        return ($payment['status'] ?? null) === 'captured'
+            && (int) ($payment['amount'] ?? 0) >= $expectedAmount
+            && strtoupper((string) ($payment['currency'] ?? $currency)) === $currency;
+    }
+
+    private function debitDriverWalletForCodCollection(Order $order): void
+    {
+        if (!$order->driver_id || (float) $order->total <= 0) {
+            return;
+        }
+
+        $currency = strtoupper(AppSetting::getValue('currency_code', 'INR') ?: 'INR');
+
+        $wallet = Wallet::where('user_id', $order->driver_id)->lockForUpdate()->first()
+            ?: Wallet::create([
+                'user_id' => $order->driver_id,
+                'balance' => 0,
+                'locked_balance' => 0,
+                'currency' => $currency,
+                'is_active' => true,
+            ]);
+
+        $exists = WalletTransaction::where('wallet_id', $wallet->id)
+            ->where('reference_type', 'driver_cod_collection')
+            ->where('reference_id', $order->id)
+            ->exists();
+
+        if ($exists) {
+            return;
+        }
+
+        $amount = (float) $order->total;
+        $wallet->decrement('balance', $amount);
+        $wallet->refresh();
+
+        WalletTransaction::create([
+            'wallet_id' => $wallet->id,
+            'user_id' => $wallet->user_id,
+            'type' => 'debit',
+            'amount' => $amount,
+            'balance_after' => $wallet->balance,
+            'reference_type' => 'driver_cod_collection',
+            'reference_id' => $order->id,
+            'description' => 'COD cash collected for order #' . ($order->order_number ?? $order->id),
+            'meta' => ['source' => 'cod_collection'],
+        ]);
+    }
+}

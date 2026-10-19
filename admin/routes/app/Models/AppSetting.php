@@ -1,0 +1,127 @@
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\Facades\Cache;
+
+class AppSetting extends Model
+{
+    protected $fillable = ['key', 'value', 'type', 'description'];
+    
+    protected $casts = [
+        'value' => 'string',
+    ];
+    
+    public static function getValue($key, $default = null)
+    {
+        try {
+            $settings = Cache::remember('app_settings', 3600, function () {
+                return self::all()->pluck('value', 'key')->toArray();
+            });
+        } catch (\Throwable $e) {
+            try {
+                $settings = self::all()->pluck('value', 'key')->toArray();
+            } catch (\Throwable $inner) {
+                return $default;
+            }
+        }
+
+        return $settings[$key] ?? $default;
+    }
+
+    public static function defaultDeliveryRadius(): float
+    {
+        try {
+            $configured = self::getValue('default_delivery_radius');
+            if (is_numeric($configured) && (float) $configured > 0) {
+                return (float) $configured;
+            }
+
+            $zoneRadius = DeliveryArea::query()
+                ->active()
+                ->where('area_type', 'circle')
+                ->max('radius_km');
+            if (is_numeric($zoneRadius) && (float) $zoneRadius > 0) {
+                return (float) $zoneRadius;
+            }
+
+            $restaurantRadius = Restaurant::query()
+                ->where('delivery_radius', '>', 0)
+                ->max('delivery_radius');
+
+            return is_numeric($restaurantRadius) ? max(0.0, (float) $restaurantRadius) : 0.0;
+        } catch (\Throwable $e) {
+            return 0.0;
+        }
+    }
+    public static function currencyDecimals(): int
+    {
+        $value = (int) self::getValue('currency_decimals', 2);
+
+        return max(2, min(5, $value));
+    }
+
+    public static function sanitizedCurrencySymbol(): string
+    {
+        return self::normalizeCurrencySymbol(
+            self::getValue('currency_symbol', self::defaultCurrencySymbol())
+        );
+    }
+
+    public static function normalizeCurrencySymbol(mixed $value): string
+    {
+        $fallback = self::defaultCurrencySymbol();
+        $symbol = trim(html_entity_decode(
+            (string) $value,
+            ENT_QUOTES | ENT_HTML5,
+            'UTF-8'
+        ));
+
+        if ($symbol === '' || ! mb_check_encoding($symbol, 'UTF-8')) {
+            return $fallback;
+        }
+
+        $normalized = preg_replace('/\s+/', '', $symbol);
+
+        if (preg_match('/^\?+$/', $normalized)
+            || preg_match('/\{\{.*\}\}/', $normalized)
+            || str_contains($normalized, 'currencySymbol')
+            || preg_match('/[\x{FFFD}\x{00C2}\x{00C3}\x{00E2}]/u', $normalized)
+        ) {
+            return $fallback;
+        }
+
+        if (mb_strlen($normalized) > 5) {
+            return $fallback;
+        }
+
+        return $symbol;
+    }
+
+    private static function defaultCurrencySymbol(): string
+    {
+        return html_entity_decode('&#8377;', ENT_QUOTES | ENT_HTML5, 'UTF-8');
+    }
+    
+    public static function setValue($key, $value)
+    {
+        if ($key === 'currency_symbol') {
+            $value = self::normalizeCurrencySymbol($value);
+        }
+
+        self::updateOrCreate(['key' => $key], ['value' => $value === null ? '' : $value]);
+
+        try {
+            Cache::forget('app_settings');
+        } catch (\Throwable $e) {
+            // Ignore cache store failures when the database/cache isn't ready yet.
+        }
+    }
+
+    public function setValueAttribute($value): void
+    {
+        $this->attributes['value'] = $value === null ? '' : (string) $value;
+    }
+}
+

@@ -1,0 +1,130 @@
+import '../config/api_constants.dart';
+import 'api_service.dart';
+
+enum DocVerifyStatus { checking, verified, invalid, unknown, unconfigured }
+
+class DocVerifyResult {
+  const DocVerifyResult(this.status, [this.message]);
+
+  final DocVerifyStatus status;
+  final String? message;
+
+  bool get isVerified => status == DocVerifyStatus.verified;
+  bool get isInvalid => status == DocVerifyStatus.invalid;
+}
+
+/// Realtime, pre-submission document verification against Cashfree's
+/// Verification Suite - used while the driver is still filling the
+/// registration form so obviously wrong numbers/documents are caught before
+/// the application is even submitted for admin review.
+class VerificationService {
+  VerificationService._();
+
+  static final VerificationService instance = VerificationService._();
+  final ApiService _api = ApiService();
+
+  String _friendlyMessage(String? raw) {
+    if (raw == null || raw.trim().isEmpty) {
+      return 'Not verified. It will be verified manually.';
+    }
+    final lower = raw.toLowerCase();
+    if (lower.contains('ip') ||
+        lower.contains('whitelist') ||
+        lower.contains('cashfree') ||
+        lower.contains('http') ||
+        lower.contains('exception') ||
+        lower.contains('socket') ||
+        lower.contains('server') ||
+        lower.contains('gateway') ||
+        lower.contains('timeout') ||
+        lower.contains('unauthorized') ||
+        lower.contains('forbidden') ||
+        lower.contains('failed') ||
+        lower.contains('connection') ||
+        lower.contains('credentials') ||
+        lower.contains('vrs')) {
+      return 'Not verified. It will be verified manually.';
+    }
+    return raw;
+  }
+
+  DocVerifyResult _fromResponse(dynamic response) {
+    final status = response is Map ? response['status']?.toString() : null;
+    final message = response is Map ? response['message']?.toString() : null;
+    switch (status) {
+      case 'verified':
+      case 'checked':
+        return DocVerifyResult(DocVerifyStatus.verified, message ?? 'Verified');
+      case 'invalid':
+        return DocVerifyResult(DocVerifyStatus.invalid, _friendlyMessage(message));
+      case 'not_configured':
+        return DocVerifyResult(DocVerifyStatus.unconfigured, message);
+      default:
+        return DocVerifyResult(DocVerifyStatus.unknown, _friendlyMessage(message));
+    }
+  }
+
+  DocVerifyResult _fromError(Object error) {
+    return const DocVerifyResult(
+      DocVerifyStatus.unknown,
+      'Not verified. It will be verified manually.',
+    );
+  }
+
+  Future<DocVerifyResult> verifyVehicleRc(String vehicleNumber) async {
+    try {
+      final response = await _api.post(
+        ApiConstants.verifyVehicleRc,
+        data: {'vehicle_number': vehicleNumber},
+      );
+      return _fromResponse(response);
+    } catch (e) {
+      return _fromError(e);
+    }
+  }
+
+  Future<DocVerifyResult> verifyDrivingLicense({
+    required String licenseNumber,
+    required String dob,
+  }) async {
+    try {
+      final response = await _api.post(
+        ApiConstants.verifyDrivingLicense,
+        data: {'license_number': licenseNumber, 'dob': dob},
+      );
+      return _fromResponse(response);
+    } catch (e) {
+      return _fromError(e);
+    }
+  }
+
+  Future<DocVerifyResult> verifyPanDocument(String filePath) async {
+    try {
+      final response = await _api.postMultipart(
+        ApiConstants.verifyPanDocument,
+        files: {'front_image': filePath},
+      );
+      return _fromResponse(response);
+    } catch (e) {
+      return _fromError(e);
+    }
+  }
+
+  Future<DocVerifyResult> verifyAadhaarDocument(
+    String frontPath, {
+    String? backPath,
+  }) async {
+    try {
+      final response = await _api.postMultipart(
+        ApiConstants.verifyAadhaarDocument,
+        files: {
+          'front_image': frontPath,
+          if (backPath != null) 'back_image': backPath,
+        },
+      );
+      return _fromResponse(response);
+    } catch (e) {
+      return _fromError(e);
+    }
+  }
+}

@@ -1,0 +1,50 @@
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.gateway
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      - redis
+      - llm
+    gpus: all
+    volumes:
+      - ./logs:/opt/voice-ai/logs
+      - ./models:/root/.cache/huggingface
+
+  llm:
+    image: vllm/vllm-openai:v0.6.6.post1
+    restart: unless-stopped
+    command:
+      - --model
+      - ${LLM_MODEL:-Qwen/Qwen3-8B-AWQ}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8001"
+      - --max-model-len
+      - ${LLM_CONTEXT_TOKENS:-8192}
+      - --gpu-memory-utilization
+      - "0.58"
+      - --trust-remote-code
+    ports:
+      - "127.0.0.1:8001:8001"
+    gpus: all
+    volumes:
+      - ./models:/root/.cache/huggingface
+
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis-data:/data
+
+volumes:
+  redis-data:

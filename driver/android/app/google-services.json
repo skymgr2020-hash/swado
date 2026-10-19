@@ -1,0 +1,144 @@
+{
+  "project_info": {
+    "project_number": "435753341002",
+    "firebase_url": "https://renjo-technology-d0684-default-rtdb.firebaseio.com",
+    "project_id": "renjo-technology-d0684",
+    "storage_bucket": "renjo-technology-d0684.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:435753341002:android:4859c146ed67724f0816b3",
+        "android_client_info": {
+          "package_name": "com.localgo.customer"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBtBEXaAePXO-X9hdbXTefnniXQqqb0wX4"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:435753341002:android:9358d47dd9c628770816b3",
+        "android_client_info": {
+          "package_name": "com.localgo.customers"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBtBEXaAePXO-X9hdbXTefnniXQqqb0wX4"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:435753341002:android:5d7a1f84abd8a2930816b3",
+        "android_client_info": {
+          "package_name": "com.localgo.driver"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBtBEXaAePXO-X9hdbXTefnniXQqqb0wX4"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:435753341002:android:1af0c384a82e2e3c0816b3",
+        "android_client_info": {
+          "package_name": "com.localgo.seller"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBtBEXaAePXO-X9hdbXTefnniXQqqb0wX4"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:435753341002:android:27154c48e4d8e75d0816b3",
+        "android_client_info": {
+          "package_name": "com.renjo.app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBtBEXaAePXO-X9hdbXTefnniXQqqb0wX4"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:435753341002:android:55a36bdf2fb8482b0816b3",
+        "android_client_info": {
+          "package_name": "com.renjo.driver"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBtBEXaAePXO-X9hdbXTefnniXQqqb0wX4"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:435753341002:android:fb3ea58b7ac3e73b0816b3",
+        "android_client_info": {
+          "package_name": "com.renjo.restro.android"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBtBEXaAePXO-X9hdbXTefnniXQqqb0wX4"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

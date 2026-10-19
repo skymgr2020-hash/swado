@@ -1,0 +1,61 @@
+name: Swado
+options:
+  bundleIdPrefix: com.renjo
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    # Points at the real hosted Swado backend so the app works on-device over
+    # any network without LAN/firewall setup. For local backend dev instead,
+    # use "http://localhost:8000/api/" (Simulator) or your Mac's LAN IP
+    # (physical device).
+    API_BASE_URL: "https://swado.online/api/"
+
+packages:
+  # Firebase Auth powers phone-OTP signup/login when GET /app/branding
+  # returns otp_service_provider="firebase" (the real swado.online backend's
+  # current setting). GoogleService-Info.plist (Swado/Resources/) is the real
+  # config for Firebase project renjo-technology-d0684, app com.renjo.app —
+  # copied from the Flutter app's ios/Runner/GoogleService-Info.plist.
+  Firebase:
+    url: https://github.com/firebase/firebase-ios-sdk
+    from: 11.6.0
+  # Added ahead of later phases so the dependency graph is declared once.
+  # Uncomment the corresponding target dependency below when each phase
+  # actually starts using it.
+  # PusherSwift:
+  #   url: https://github.com/pusher/pusher-websocket-swift
+  #   from: 10.1.5
+
+targets:
+  Swado:
+    type: application
+    platform: iOS
+    sources:
+      - path: Swado
+    resources:
+      - path: Swado/Resources/Assets.xcassets
+      - path: Swado/Resources/GoogleService-Info.plist
+    info:
+      path: Swado/Resources/Info.plist
+      properties:
+        CFBundleDisplayName: Swado
+        UILaunchScreen: {}
+        API_BASE_URL: "$(API_BASE_URL)"
+        # REVERSED_CLIENT_ID from GoogleService-Info.plist — Firebase Phone
+        # Auth's reCAPTCHA fallback redirects back into the app via this
+        # custom URL scheme when silent push verification isn't available.
+        CFBundleURLTypes:
+          - CFBundleURLSchemes:
+              - com.googleusercontent.apps.596992936599-32t3jdta96rs6a3gi014davl3bkedkn8
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.renjo.app
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+    dependencies:
+      - package: Firebase
+        product: FirebaseAuth

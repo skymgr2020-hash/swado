@@ -1,0 +1,36 @@
+# Signing keys / credentials -- must never be committed, regardless of
+# which subproject or package they live under (including the CodeCanyon
+# package copies).
+#
+# database.sqlite is included here too: GitHub's push protection caught
+# real OpenAI/AWS keys stored inline in admin/database/database.sqlite and
+# its codecanyon-foodflow copy (admin-configurable integration credentials
+# saved into the DB by the app itself) -- excluding every database.sqlite
+# in the tree (Accounts/, admin/, HRMS/, codecanyon-foodflow/) rather than
+# just the two GitHub happened to flag.
+database.sqlite
+key.properties
+*.jks
+*.keystore
+*.p12
+*.pem
+.env
+.env.*
+!.env.example
+!**/.env.deploy.example
+
+# Dependency directories -- regenerable, shouldn't be tracked.
+vendor/
+node_modules/
+
+# Build output -- regenerable, shouldn't be tracked.
+build/
+.dart_tool/
+.pub-cache/
+
+# Large deploy/backup archives at the root -- not source, not meant for
+# version control.
+*.zip
+*.tar.gz
+*.tgz
+*.hprof

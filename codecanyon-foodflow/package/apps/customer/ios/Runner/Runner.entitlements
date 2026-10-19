@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>aps-environment</key>
+	<string>development</string>
+	<key>com.apple.developer.applesignin</key>
+	<array>
+		<string>Default</string>
+	</array>
+	<key>com.apple.developer.associated-domains</key>
+	<array>
+		<string>applinks:Swado.onelink.me</string>
+		<!--
+			Movie-theatre seat QR stickers. Which paths actually open the app
+			is decided by the apple-app-site-association file the backend
+			serves (scoped to /t/*), not here — iOS only needs the host
+			listed to go and fetch it.
+		-->
+		<string>applinks:swado.online</string>
+		<string>applinks:www.swado.online</string>
+	</array>
+</dict>
+</plist>

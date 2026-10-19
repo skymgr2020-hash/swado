@@ -1,0 +1,1157 @@
+// lib/main.dart
+import 'dart:async';
+
+import 'package:flutter/rendering.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
+import 'package:google_fonts/google_fonts.dart';
+import 'package:provider/provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:flutter_easyloading/flutter_easyloading.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:google_mobile_ads/google_mobile_ads.dart';
+import 'firebase_options.dart';
+import 'services/notification_service.dart';
+import 'services/navigation_service.dart';
+import 'services/sound_service.dart';
+import 'services/local_cache_service.dart';
+import 'services/app_branding_service.dart';
+import 'services/appsflyer_deep_link_service.dart';
+import 'services/seat_deep_link_service.dart';
+import 'services/tracking_authorization_service.dart';
+import 'services/app_update_service.dart';
+import 'services/app_image_cache.dart';
+import 'config/app_config.dart';
+import 'models/app_branding.dart';
+import 'theme/foodflow_theme.dart';
+import 'theme/responsive_theme.dart';
+import 'theme/brand_palette.dart';
+import 'providers/auth_provider.dart';
+import 'providers/cart_provider.dart';
+import 'providers/order_provider.dart';
+import 'providers/restaurant_provider.dart';
+import 'providers/dining_provider.dart';
+import 'models/order.dart';
+import 'models/scratch_card.dart';
+import 'models/address.dart' as app_address;
+import 'screens/onboarding/onboarding_screen.dart';
+import 'screens/auth/login_screen.dart';
+import 'screens/auth/register_screen.dart';
+import 'screens/auth/forgot_password_screen.dart';
+import 'screens/app_splash_screen.dart';
+import 'screens/location_gate_screen.dart';
+import 'screens/customer/home_screen.dart';
+import 'screens/customer/restaurant_detail_screen.dart';
+import 'screens/customer/cart_screen.dart';
+import 'screens/customer/checkout_screen.dart';
+
+import 'screens/customer/map_picker_screen.dart';
+import 'screens/customer/saved_restaurants_screen.dart';
+import 'screens/customer/offers_screen.dart';
+import 'screens/customer/menu_taxonomy_filter_screen.dart';
+import 'screens/customer/promotion_product_grid_screen.dart';
+import 'screens/customer/privacy_legal_screen.dart';
+import 'screens/customer/order_confirmation_screen.dart';
+import 'screens/customer/order_chat_screen.dart';
+import 'screens/customer/order_tracking_screen.dart';
+import 'screens/customer/orders_screen.dart';
+import 'screens/customer/notification_preferences_screen.dart';
+import 'screens/customer/notifications_screen.dart';
+import 'screens/customer/profile_screen.dart';
+import 'screens/customer/home_experience.dart';
+import 'screens/customer/home_v2/theme/v2_theme.dart';
+import 'screens/customer/address_screen.dart';
+import 'screens/customer/add_address_screen.dart';
+import 'screens/customer/search_screen.dart';
+import 'screens/customer/ai_voice_assistant_screen.dart';
+import 'screens/customer/customer_support_screen.dart';
+import 'screens/customer/dining_bookings_list_screen.dart';
+import 'screens/customer/gold_subscription_screen.dart';
+import 'screens/customer/wallet_screen.dart';
+import 'screens/customer/scratch_cards_screen.dart';
+import 'screens/customer/referral_screen.dart';
+import 'widgets/common/animated_loading_spinner.dart';
+import 'utils/route_observer.dart';
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  AppImageCache.configureMemoryCache();
+  unawaited(loadHomeExperiencePref());
+  unawaited(loadV2Mode());
+
+  configLoading();
+  await MobileAds.instance.initialize();
+  final authProvider = AuthProvider();
+  final cartProvider = CartProvider();
+  final startupFuture = _initializeStartup(authProvider, cartProvider);
+
+  _logStartupStep('runApp');
+
+  runApp(
+    MultiProvider(
+      providers: [
+        ChangeNotifierProvider.value(value: authProvider),
+        ChangeNotifierProvider.value(value: cartProvider),
+        ChangeNotifierProvider(create: (_) => OrderProvider()),
+        ChangeNotifierProvider(create: (_) => RestaurantProvider()),
+        ChangeNotifierProvider(create: (_) => DiningProvider()),
+      ],
+      child: FoodDeliveryApp(startupFuture: startupFuture),
+    ),
+  );
+
+  WidgetsBinding.instance.addPostFrameCallback((_) {
+    unawaited(_initializeAfterFirstFrame());
+    unawaited(
+      startupFuture.then(
+        (_) => AppUpdateService.checkForLatestRelease(appKey: 'customer'),
+      ),
+    );
+  });
+}
+
+Future<void> _initializeStartup(
+  AuthProvider authProvider,
+  CartProvider cartProvider,
+) async {
+  await _runStartupStep('firebase core', _ensureFirebaseInitialized);
+  await _runStartupStep(
+    'auth session',
+    () => authProvider.loadUser(forceRefresh: false),
+  );
+  if (authProvider.isAuthenticated && !authProvider.canUseCurrentApp) {
+    await _runStartupStep('logout invalid app role', authProvider.logout);
+  }
+  unawaited(cartProvider.loadCart());
+}
+
+Future<void> _initializeAfterFirstFrame() async {
+  await _runStartupStep('local cache', LocalCacheService.initialize);
+  await _runStartupStep(
+    'shared preferences',
+    () async {
+      await SharedPreferences.getInstance();
+    },
+  );
+
+  // Ask for App Tracking Transparency before anything that could track the
+  // user (push permission prompt, AppsFlyer). Must be its own step so iOS is
+  // not presenting another system alert at the same time.
+  await _runStartupStep(
+    'app tracking transparency',
+    TrackingAuthorizationService.instance.ensureRequested,
+  );
+
+  if (defaultTargetPlatform == TargetPlatform.iOS) {
+    unawaited(
+      Future<void>.delayed(const Duration(seconds: 2)).then(
+        (_) => _runStartupStep('sound deferred', SoundService.init),
+      ),
+    );
+  } else {
+    await _runStartupStep('sound', SoundService.init);
+  }
+
+  await _runStartupStep(
+    'notifications',
+    FirebaseNotificationService.instance.initialize,
+  );
+  await _runStartupStep(
+    'appsflyer deep links',
+    AppsFlyerDeepLinkService.instance.initialize,
+  );
+  // Scanned armrest stickers (https://<host>/t/...). Separate from the
+  // AppsFlyer handler above, which is for marketing attribution links --
+  // a seat sticker is not a campaign.
+  await _runStartupStep(
+    'seat deep links',
+    SeatDeepLinkService.instance.initialize,
+  );
+}
+
+Future<void> _ensureFirebaseInitialized() async {
+  if (Firebase.apps.isNotEmpty) return;
+
+  // Always initialize from firebase_options.dart so the Dart-side default app
+  // is pinned to the correct project (renjo-technology-d0684) even if a stale
+  // GoogleService-Info.plist / google-services.json is bundled.
+  await Firebase.initializeApp(
+    options: DefaultFirebaseOptions.currentPlatform,
+  );
+}
+
+Future<void> _runStartupStep(
+  String name,
+  Future<void> Function() action,
+) async {
+  _logStartupStep('$name start');
+  try {
+    await action();
+    _logStartupStep('$name done');
+  } catch (e, stackTrace) {
+    debugPrint('Startup initiate: $name skipped: $e');
+    debugPrintStack(stackTrace: stackTrace);
+  }
+}
+
+void _logStartupStep(String message) {
+  debugPrint('Startup initiate: $message');
+}
+
+void configLoading() {
+  EasyLoading.instance
+    ..displayDuration = const Duration(milliseconds: 2000)
+    ..indicatorType = EasyLoadingIndicatorType.fadingCircle
+    ..indicatorWidget = const AnimatedLoadingSpinner(
+      size: 44,
+      strokeWidth: 4,
+      color: Colors.white,
+    )
+    ..loadingStyle = EasyLoadingStyle.custom
+    ..indicatorSize = 45.0
+    ..radius = 14.0
+    ..progressColor = Colors.white
+    ..backgroundColor = Colors.black.withOpacity(0.82)
+    ..indicatorColor = Colors.white
+    ..textColor = Colors.white
+    ..maskColor = Colors.black.withOpacity(0.16)
+    ..userInteractions = false
+    ..dismissOnTap = false;
+}
+
+int? _parseOrderId(dynamic args) {
+  if (args == null) return null;
+  if (args is int) return args;
+  if (args is String) return int.tryParse(args);
+  if (args is double) return args.toInt();
+  return null;
+}
+
+List<ScratchCard> _parseScratchCardsArgument(dynamic value) {
+  if (value is! List) return const [];
+
+  return value
+      .map((item) {
+        if (item is ScratchCard) return item;
+        if (item is Map) {
+          return ScratchCard.fromJson(Map<String, dynamic>.from(item));
+        }
+        return null;
+      })
+      .whereType<ScratchCard>()
+      .where((card) => card.id > 0)
+      .toList(growable: false);
+}
+
+int? _parseRestaurantId(dynamic args) {
+  if (args == null) return null;
+  if (args is int) return args > 0 ? args : null;
+  if (args is double) {
+    final value = args.toInt();
+    return value > 0 ? value : null;
+  }
+  if (args is String) {
+    final value = int.tryParse(args.trim());
+    return value != null && value > 0 ? value : null;
+  }
+  if (args is Map) {
+    return _parseRestaurantId(args['restaurantId'] ?? args['id']);
+  }
+  return null;
+}
+
+int? _parseMenuItemId(dynamic args) {
+  if (args == null) return null;
+  if (args is int) return args > 0 ? args : null;
+  if (args is double) {
+    final value = args.toInt();
+    return value > 0 ? value : null;
+  }
+  if (args is String) {
+    final value = int.tryParse(args.trim());
+    return value != null && value > 0 ? value : null;
+  }
+  if (args is Map) {
+    return _parseMenuItemId(
+      args['menuItemId'] ?? args['menu_item_id'] ?? args['item_id'],
+    );
+  }
+  return null;
+}
+
+Route<dynamic> _errorRoute(String message) {
+  return MaterialPageRoute(
+    builder: (_) => Scaffold(
+      appBar: AppBar(title: const Text('Error')),
+      body: Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24.0),
+          child: Text(
+            message,
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: Colors.red),
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
+class FoodDeliveryApp extends StatefulWidget {
+  const FoodDeliveryApp({
+    super.key,
+    required this.startupFuture,
+  });
+
+  final Future<void> startupFuture;
+
+  @override
+  State<FoodDeliveryApp> createState() => _FoodDeliveryAppState();
+}
+
+class _FoodDeliveryAppState extends State<FoodDeliveryApp> {
+  AppBranding? _branding;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadBranding();
+  }
+
+  Future<void> _loadBranding() async {
+    final branding = await AppBrandingService.instance.loadBranding();
+    if (!mounted) return;
+    setState(() {
+      _branding = branding;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final authProvider = Provider.of<AuthProvider>(context, listen: false);
+    final palette = BrandPalette.fromBranding(_branding);
+    const homeCanvas = Color(0xFFFAFAFA);
+    const homeText = Color(0xFF111827);
+    const homeMuted = Color(0xFF6B7280);
+    const homeBorder = Color(0xFFE5E7EB);
+    return MaterialApp(
+      navigatorKey: appNavigatorKey,
+      title: _branding?.displayName ?? AppConfig.appName,
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: palette.primary,
+          primary: palette.primary,
+          secondary: palette.secondary,
+          surface: Colors.white,
+          error: FoodFlowTheme.danger,
+        ),
+        primaryColor: palette.primary,
+        scaffoldBackgroundColor: homeCanvas,
+        visualDensity: const VisualDensity(horizontal: -3, vertical: -3),
+        materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        fontFamily: GoogleFonts.poppins().fontFamily,
+        useMaterial3: true,
+        // Smoother, consistent route transitions across the whole app
+        // (both the classic screens and V2) — the M3 zoom/fade instead of the
+        // plain platform slide. Snapshotting left at its default (enabled):
+        // disabling it forces Flutter to recomposite the outgoing route's
+        // live layer tree every transition frame instead of a cached
+        // snapshot -- on V1's heavy home screen that's the single biggest
+        // jank source during every push/pop, since V2's custom route
+        // (V2PageRoute) only animates the incoming page and never touches
+        // the outgoing tree at all.
+        pageTransitionsTheme: const PageTransitionsTheme(
+          builders: {
+            TargetPlatform.android: ZoomPageTransitionsBuilder(),
+            // iOS intentionally omitted: use Flutter's built-in Cupertino
+            // transition. (Newer Flutter stable dropped the public
+            // CupertinoPageTransitionsBuilder name.)
+          },
+        ),
+        // InkRipple, not InkSparkle: InkSparkle is shader-based, and the
+        // first InkWell/button tap after launch can hitch while that shader
+        // compiles -- a V1-specific "taps feel janky" source (V2 avoids ink
+        // splashes entirely via V2Tappable). InkRipple is the cheaper,
+        // CPU-drawn ripple Material used before M3's InkSparkle default and
+        // has no first-tap compile cost.
+        splashFactory: InkRipple.splashFactory,
+        textTheme: AppTypography.material3(
+          base: GoogleFonts.poppinsTextTheme(),
+          textColor: homeText,
+          mutedColor: homeMuted,
+        ),
+        appBarTheme: AppBarTheme(
+          elevation: 0,
+          centerTitle: false,
+          backgroundColor: homeCanvas,
+          foregroundColor: homeText,
+          iconTheme: const IconThemeData(color: homeText),
+          titleTextStyle: const TextStyle(
+            color: homeText,
+            fontSize: 18,
+            fontWeight: FontWeight.w800,
+          ),
+          toolbarHeight: 52,
+          scrolledUnderElevation: 0,
+          surfaceTintColor: Colors.transparent,
+        ),
+        tabBarTheme: TabBarThemeData(
+          labelColor: palette.primary,
+          unselectedLabelColor: FoodFlowTheme.muted,
+          indicatorColor: palette.primary,
+          labelStyle:
+              const TextStyle(fontWeight: FontWeight.w700, fontSize: 13),
+          unselectedLabelStyle:
+              const TextStyle(fontWeight: FontWeight.w700, fontSize: 13),
+          dividerColor: Colors.transparent,
+        ),
+        dividerTheme: const DividerThemeData(
+          color: FoodFlowTheme.line,
+          thickness: 1,
+          space: 1,
+        ),
+        listTileTheme: ListTileThemeData(
+          iconColor: palette.primary,
+          textColor: homeText,
+          dense: true,
+          contentPadding:
+              const EdgeInsets.symmetric(horizontal: 16, vertical: 2),
+          minLeadingWidth: 18,
+          titleTextStyle: const TextStyle(
+            color: homeText,
+            fontSize: 15,
+            fontWeight: FontWeight.w700,
+          ),
+          subtitleTextStyle: const TextStyle(
+            color: homeMuted,
+            fontSize: 13,
+            fontWeight: FontWeight.w500,
+          ),
+        ),
+        chipTheme: ChipThemeData(
+          backgroundColor: palette.primarySoft,
+          selectedColor: palette.primarySoft,
+          checkmarkColor: palette.primary,
+          labelStyle: TextStyle(
+            color: palette.text,
+            fontWeight: FontWeight.w700,
+            fontSize: 12,
+          ),
+          side: BorderSide(color: palette.primary.withOpacity(0.16)),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(7)),
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 1),
+        ),
+        bottomNavigationBarTheme: BottomNavigationBarThemeData(
+          backgroundColor: Colors.white,
+          selectedItemColor: palette.primary,
+          unselectedItemColor: FoodFlowTheme.muted,
+          unselectedLabelStyle:
+              const TextStyle(fontWeight: FontWeight.w600, fontSize: 12),
+          selectedLabelStyle:
+              const TextStyle(fontWeight: FontWeight.w700, fontSize: 12),
+          selectedIconTheme: const IconThemeData(size: 20),
+          unselectedIconTheme: const IconThemeData(size: 18),
+          type: BottomNavigationBarType.fixed,
+          showUnselectedLabels: true,
+          elevation: 3,
+        ),
+        inputDecorationTheme: InputDecorationTheme(
+          border: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(12),
+            borderSide: BorderSide.none,
+          ),
+          enabledBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(12),
+            borderSide: const BorderSide(color: homeBorder),
+          ),
+          focusedBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(12),
+            borderSide: BorderSide(color: palette.primary, width: 1.2),
+          ),
+          errorBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(12),
+            borderSide: const BorderSide(color: FoodFlowTheme.danger),
+          ),
+          focusedErrorBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(12),
+            borderSide:
+                const BorderSide(color: FoodFlowTheme.danger, width: 1.2),
+          ),
+          filled: true,
+          fillColor: Colors.white,
+          contentPadding: AppSpacing.input,
+          prefixIconColor: palette.primary,
+          suffixIconColor: homeMuted,
+          labelStyle: const TextStyle(
+              color: homeMuted, fontWeight: FontWeight.w700, fontSize: 15),
+          hintStyle: const TextStyle(
+              color: homeMuted, fontWeight: FontWeight.w600, fontSize: 15),
+          floatingLabelStyle: TextStyle(
+              color: palette.primary,
+              fontWeight: FontWeight.w700,
+              fontSize: 15),
+          isDense: true,
+        ),
+        elevatedButtonTheme: ElevatedButtonThemeData(
+          style: ElevatedButton.styleFrom(
+            backgroundColor: palette.primary,
+            foregroundColor: Colors.white,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+            ),
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+            minimumSize: const Size(0, 46),
+            textStyle: const TextStyle(
+              fontSize: 15,
+              fontWeight: FontWeight.w700,
+              letterSpacing: 0.2,
+            ),
+            elevation: 0,
+            shadowColor: Colors.transparent,
+          ),
+        ),
+        outlinedButtonTheme: OutlinedButtonThemeData(
+          style: OutlinedButton.styleFrom(
+            side: BorderSide(color: homeBorder),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+            ),
+            foregroundColor: homeText,
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 11),
+            minimumSize: const Size(0, 46),
+            textStyle: const TextStyle(
+              fontSize: 15,
+              fontWeight: FontWeight.w700,
+              letterSpacing: 0.2,
+            ),
+          ),
+        ),
+        filledButtonTheme: FilledButtonThemeData(
+          style: FilledButton.styleFrom(
+            backgroundColor: palette.primary,
+            foregroundColor: Colors.white,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+            ),
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+            minimumSize: const Size(0, 46),
+            textStyle: const TextStyle(
+              fontSize: 15,
+              fontWeight: FontWeight.w700,
+              letterSpacing: 0.2,
+            ),
+          ),
+        ),
+        cardTheme: CardThemeData(
+          elevation: 0,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(22),
+            side: const BorderSide(color: homeBorder),
+          ),
+          margin: EdgeInsets.zero,
+          color: Colors.white,
+        ),
+        snackBarTheme: SnackBarThemeData(
+          backgroundColor: palette.primary,
+          contentTextStyle: const TextStyle(color: Colors.white),
+          behavior: SnackBarBehavior.floating,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(16),
+          ),
+        ),
+        bottomSheetTheme: const BottomSheetThemeData(
+          backgroundColor: Colors.white,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+          ),
+        ),
+        floatingActionButtonTheme: FloatingActionButtonThemeData(
+          backgroundColor: palette.primary,
+          foregroundColor: Colors.white,
+          elevation: 3,
+          extendedTextStyle:
+              const TextStyle(fontWeight: FontWeight.w700, fontSize: 14),
+        ),
+        textButtonTheme: TextButtonThemeData(
+          style: TextButton.styleFrom(
+            foregroundColor: palette.primary,
+            textStyle:
+                const TextStyle(fontWeight: FontWeight.w700, fontSize: 14),
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+            minimumSize: const Size(0, 32),
+          ),
+        ),
+      ),
+      home: AppSplashScreen(
+        branding: _branding,
+        startupFuture: widget.startupFuture,
+        builder: (context) {
+          final destination = _canOpenCustomerBrowseExperience(authProvider)
+              ? const HomeScreen()
+              : const LoginScreen();
+          if (!AppConfig.isCustomerApp) return destination;
+          return LocationGateScreen(destinationBuilder: (_) => destination);
+        },
+      ),
+      navigatorObservers: [routeObserver],
+      onGenerateRoute: (settings) => _generateRoute(context, settings),
+      builder: (context, child) {
+        final loadingChild = EasyLoading.init()(context, child);
+        return GestureDetector(
+          behavior: HitTestBehavior.translucent,
+          onTap: () => FocusManager.instance.primaryFocus?.unfocus(),
+          child: NotificationListener<UserScrollNotification>(
+            onNotification: (notification) {
+              if (notification.direction != ScrollDirection.idle) {
+                FocusManager.instance.primaryFocus?.unfocus();
+              }
+              return false;
+            },
+            child: ResponsiveMedia.withClampedTextScale(
+              context: context,
+              child: loadingChild,
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  bool _canBrowseAsGuest() {
+    return AppConfig.isCustomerApp || !AppConfig.isRoleLocked;
+  }
+
+  bool _canOpenCustomerBrowseExperience(AuthProvider authProvider) {
+    return authProvider.isAuthenticated && authProvider.canUseCurrentApp ||
+        _canBrowseAsGuest();
+  }
+
+  bool _canUseAccountFeatures(BuildContext context) {
+    final authProvider = Provider.of<AuthProvider>(context, listen: false);
+    return authProvider.isAuthenticated && authProvider.canUseCurrentApp;
+  }
+
+  Route<dynamic> _accountRoute(
+    BuildContext context,
+    WidgetBuilder builder,
+  ) {
+    if (!_canUseAccountFeatures(context)) {
+      return MaterialPageRoute(builder: (_) => const LoginScreen());
+    }
+    return MaterialPageRoute(builder: builder);
+  }
+
+  Route<dynamic>? _generateRoute(BuildContext context, RouteSettings settings) {
+    if (_isFirebaseAuthCallbackRoute(settings.name)) {
+      return MaterialPageRoute(builder: (_) => const LoginScreen());
+    }
+
+    final deepLinkRoute = _generateDeepLinkRoute(settings);
+    if (deepLinkRoute != null) {
+      return deepLinkRoute;
+    }
+
+    if (_isAppsFlyerOneLinkRoute(settings.name)) {
+      return MaterialPageRoute(builder: (_) => const HomeScreen());
+    }
+
+    switch (settings.name) {
+      // Onboarding Route
+      case '/onboarding':
+        return MaterialPageRoute(builder: (_) => const OnboardingScreen());
+      // Auth Routes
+      case '/login':
+        return MaterialPageRoute(builder: (_) => const LoginScreen());
+      case '/login/form':
+        return MaterialPageRoute(builder: (_) => const LoginScreen());
+      case '/register':
+        final args = settings.arguments;
+        if (args is Map) {
+          return MaterialPageRoute(
+            builder: (_) => RegisterScreen(
+              initialPhone: args['phone']?.toString(),
+              initialEmail: args['email']?.toString(),
+              verifiedPhoneToken:
+                  (args['verified_phone_token'] ?? args['verifiedPhoneToken'])
+                      ?.toString(),
+            ),
+          );
+        }
+        return MaterialPageRoute(builder: (_) => const RegisterScreen());
+      case '/forgot-password':
+        return MaterialPageRoute(
+          builder: (_) => const ForgotPasswordScreen(),
+        );
+      case '/home':
+        final authProvider = Provider.of<AuthProvider>(context, listen: false);
+        if (!_canOpenCustomerBrowseExperience(authProvider)) {
+          return MaterialPageRoute(builder: (_) => const LoginScreen());
+        }
+        return MaterialPageRoute(builder: (_) => const HomeScreen());
+
+      // Customer Routes
+      case '/customer/home':
+        return MaterialPageRoute(builder: (_) => const HomeScreen());
+      case '/restaurant/detail':
+        final restaurantId = _parseRestaurantId(settings.arguments);
+        if (restaurantId != null) {
+          return MaterialPageRoute(
+            builder: (_) => RestaurantDetailScreen(
+              restaurantId: restaurantId,
+              initialMenuItemId: _parseMenuItemId(settings.arguments),
+            ),
+          );
+        }
+        return _errorRoute('Invalid restaurant ID');
+      case '/cart':
+        return MaterialPageRoute(builder: (_) => const CartScreen());
+      case '/checkout':
+        return _accountRoute(context, (_) => const CheckoutScreen());
+      case '/map-picker':
+        final args = settings.arguments;
+        return MaterialPageRoute(
+          builder: (_) => MapPickerScreen(
+            address: args is app_address.Address ? args : null,
+          ),
+        );
+      case '/saved-restaurants':
+        return _accountRoute(context, (_) => const SavedRestaurantsScreen());
+      case '/offers':
+        return MaterialPageRoute(builder: (_) => const OffersScreen());
+      case '/promotion-products':
+        return MaterialPageRoute(
+          builder: (_) =>
+              PromotionProductGridScreen.fromArguments(settings.arguments),
+        );
+      case '/menu-taxonomy-filter':
+        final args = settings.arguments is Map
+            ? Map<String, dynamic>.from(settings.arguments as Map)
+            : const <String, dynamic>{};
+        final filterType = (args['filter_type']?.toString() ??
+                args['type']?.toString() ??
+                'category')
+            .toLowerCase();
+        final isCuisineFilter = filterType.contains('cuisine');
+        final isSubcategoryFilter = filterType.contains('subcategory') ||
+            filterType.contains('sub_category');
+        final filterIdSource = args['filter_id'] ??
+            (isCuisineFilter
+                ? args['cuisine_id']
+                : isSubcategoryFilter
+                    ? args['subcategory_id'] ?? args['sub_category_id']
+                    : args['category_id']) ??
+            args['id'];
+        return MaterialPageRoute(
+          builder: (_) => MenuTaxonomyFilterScreen(
+            title: args['title']?.toString() ??
+                args['category']?.toString() ??
+                args['query']?.toString() ??
+                'Menu Items',
+            subtitle: args['subtitle']?.toString() ??
+                'Menu items matched from restaurants near you',
+            filterType: filterType,
+            filterId: int.tryParse((filterIdSource ?? '').toString()),
+            imageUrl: args['image_url']?.toString() ?? args['icon']?.toString(),
+          ),
+        );
+      case '/privacy-legal':
+        return MaterialPageRoute(builder: (_) => const PrivacyLegalScreen());
+      case '/order/confirmation':
+        if (!_canUseAccountFeatures(context)) {
+          return MaterialPageRoute(builder: (_) => const LoginScreen());
+        }
+        final args = settings.arguments;
+        if (args is Map && args['orderId'] is int) {
+          return MaterialPageRoute(
+            builder: (_) => OrderConfirmationScreen(
+              orderId: args['orderId'] as int,
+              orderNumber:
+                  args['orderNumber']?.toString() ?? 'ORD${args['orderId']}',
+              restaurantName: args['restaurantName']?.toString() ?? '',
+              restaurantLogoUrl: args['restaurantLogoUrl']?.toString() ?? '',
+              paymentGatewayName: args['paymentGatewayName']?.toString() ?? '',
+              paymentGatewayLogoUrl:
+                  args['paymentGatewayLogoUrl']?.toString() ?? '',
+              subtotal: (args['subtotal'] is num)
+                  ? (args['subtotal'] as num).toDouble()
+                  : double.tryParse(args['subtotal']?.toString() ?? '0') ?? 0,
+              discount: (args['discount'] is num)
+                  ? (args['discount'] as num).toDouble()
+                  : double.tryParse(args['discount']?.toString() ?? '0') ?? 0,
+              savedAmount: (args['savedAmount'] is num)
+                  ? (args['savedAmount'] as num).toDouble()
+                  : double.tryParse(args['savedAmount']?.toString() ?? '') ??
+                      ((args['discount'] is num)
+                          ? (args['discount'] as num).toDouble()
+                          : double.tryParse(
+                                  args['discount']?.toString() ?? '0') ??
+                              0),
+              deliveryFee: (args['deliveryFee'] is num)
+                  ? (args['deliveryFee'] as num).toDouble()
+                  : double.tryParse(args['deliveryFee']?.toString() ?? '0') ??
+                      0,
+              platformFee: (args['platformFee'] is num)
+                  ? (args['platformFee'] as num).toDouble()
+                  : double.tryParse(args['platformFee']?.toString() ?? '0') ??
+                      0,
+              tax: (args['tax'] is num)
+                  ? (args['tax'] as num).toDouble()
+                  : double.tryParse(args['tax']?.toString() ?? '0') ?? 0,
+              taxLabel: args['taxLabel']?.toString() ?? 'Tax',
+              total: (args['total'] is num)
+                  ? (args['total'] as num).toDouble()
+                  : double.tryParse(args['total']?.toString() ?? '0') ?? 0,
+              couponCode: args['couponCode']?.toString(),
+              scheduledTime: args['scheduledTime'] != null
+                  ? DateTime.tryParse(args['scheduledTime'].toString())
+                  : null,
+              initialScratchCards:
+                  _parseScratchCardsArgument(args['scratchCards']),
+            ),
+          );
+        }
+        return _errorRoute('Invalid order confirmation data');
+      case '/order/track':
+        if (!_canUseAccountFeatures(context)) {
+          return MaterialPageRoute(builder: (_) => const LoginScreen());
+        }
+        final orderId = _parseOrderId(settings.arguments);
+        if (orderId == null) {
+          return _errorRoute('Invalid order ID supplied for order tracking.');
+        }
+        return MaterialPageRoute(
+          builder: (_) => OrderTrackingScreen(orderId: orderId),
+        );
+      case '/order/chat':
+        if (!_canUseAccountFeatures(context)) {
+          return MaterialPageRoute(builder: (_) => const LoginScreen());
+        }
+        final args = settings.arguments;
+        if (args is Order) {
+          return MaterialPageRoute(
+            builder: (_) => OrderChatScreen(order: args),
+          );
+        }
+        if (args is Map && args['order'] is Order) {
+          return MaterialPageRoute(
+            builder: (_) => OrderChatScreen(
+              order: args['order'] as Order,
+              orderId: _parseOrderId(args['orderId']),
+            ),
+          );
+        }
+        final orderId =
+            _parseOrderId(args is Map ? args['orderId'] ?? args['id'] : args);
+        if (orderId == null) {
+          return _errorRoute('Invalid order ID supplied for order chat.');
+        }
+        return MaterialPageRoute(
+          builder: (_) => OrderChatScreen(orderId: orderId),
+        );
+      case '/orders':
+        return _accountRoute(context, (_) => const OrdersScreen());
+      case '/profile':
+        return _accountRoute(context, (_) => const ProfileScreen());
+      case '/addresses':
+        return _accountRoute(context, (_) => const AddressScreen());
+      case '/addresses/add':
+        if (!_canUseAccountFeatures(context)) {
+          return MaterialPageRoute(builder: (_) => const LoginScreen());
+        }
+        final args = settings.arguments;
+        return MaterialPageRoute(
+          builder: (_) => AddAddressScreen(address: args),
+        );
+      case '/addresses/edit':
+        if (!_canUseAccountFeatures(context)) {
+          return MaterialPageRoute(builder: (_) => const LoginScreen());
+        }
+        final args = settings.arguments;
+        return MaterialPageRoute(
+          builder: (_) => AddAddressScreen(address: args),
+        );
+      case '/search':
+        return MaterialPageRoute(builder: (_) => const SearchScreen());
+      case '/ai-voice':
+        return _accountRoute(context, (_) => const AiVoiceAssistantScreen());
+      case '/notifications':
+        return _accountRoute(context, (_) => const NotificationsScreen());
+      case '/notification-preferences':
+        return _accountRoute(
+          context,
+          (_) => const NotificationPreferencesScreen(),
+        );
+      case '/support':
+        if (!_canUseAccountFeatures(context)) {
+          return MaterialPageRoute(builder: (_) => const LoginScreen());
+        }
+        final args = settings.arguments;
+        if (args is Map) {
+          return MaterialPageRoute(
+            builder: (_) => CustomerSupportScreen(
+              order: args['order'] is Order ? args['order'] as Order : null,
+              openChat: args['openChat'] == true,
+            ),
+          );
+        }
+        return MaterialPageRoute(builder: (_) => const CustomerSupportScreen());
+      case '/wallet':
+        return _accountRoute(context, (_) => const WalletScreen());
+      case '/gold':
+        return _accountRoute(context, (_) => const GoldSubscriptionScreen());
+      case '/scratch-cards':
+        return _accountRoute(
+          context,
+          (_) => ScratchCardsScreen(orderId: _parseOrderId(settings.arguments)),
+        );
+      case '/referrals':
+        return _accountRoute(context, (_) => const ReferralScreen());
+      case '/dining/bookings':
+        return _accountRoute(context, (_) => const DiningBookingsListScreen());
+
+      default:
+        return _errorRoute('Page not found: ${settings.name}');
+    }
+  }
+
+  bool _isFirebaseAuthCallbackRoute(String? routeName) {
+    final rawName = routeName?.trim();
+    if (rawName == null || rawName.isEmpty) return false;
+
+    Uri uri;
+    try {
+      uri = Uri.parse(rawName);
+    } catch (_) {
+      return false;
+    }
+
+    if (_isFirebaseAuthCallbackUri(uri)) return true;
+
+    final nestedDeepLink =
+        uri.queryParameters['deep_link_id'] ?? uri.queryParameters['link'];
+    if (nestedDeepLink == null || nestedDeepLink.trim().isEmpty) {
+      return false;
+    }
+
+    try {
+      return _isFirebaseAuthCallbackUri(Uri.parse(nestedDeepLink.trim()));
+    } catch (_) {
+      return false;
+    }
+  }
+
+  bool _isFirebaseAuthCallbackUri(Uri uri) {
+    return uri.host == 'PLACE_AUTH_DOMAIN_HERE' &&
+        uri.path == '/__/auth/callback' &&
+        uri.queryParameters['authType'] == 'verifyApp';
+  }
+
+  bool _isAppsFlyerOneLinkRoute(String? routeName) {
+    final rawName = routeName?.trim();
+    if (rawName == null || rawName.isEmpty) return false;
+
+    Uri uri;
+    try {
+      uri = Uri.parse(rawName);
+    } catch (_) {
+      return false;
+    }
+
+    final oneLinkDomain = AppConfig.appsFlyerOneLinkDomain
+        .trim()
+        .replaceFirst(RegExp(r'^https?://'), '')
+        .replaceFirst(RegExp(r'/$'), '');
+    if (oneLinkDomain.isEmpty || uri.host != oneLinkDomain) return false;
+
+    final expectedSegments = AppConfig.appsFlyerOneLinkPath
+        .split('/')
+        .map((segment) => segment.trim())
+        .where((segment) => segment.isNotEmpty)
+        .toList(growable: false);
+    if (expectedSegments.isEmpty) return true;
+
+    final actualSegments = uri.pathSegments
+        .map((segment) => segment.trim())
+        .where((segment) => segment.isNotEmpty)
+        .toList(growable: false);
+    if (actualSegments.length < expectedSegments.length) return false;
+
+    for (var i = 0; i < expectedSegments.length; i++) {
+      if (actualSegments[i] != expectedSegments[i]) return false;
+    }
+    return true;
+  }
+
+  Route<dynamic>? _generateDeepLinkRoute(RouteSettings settings) {
+    final rawName = settings.name?.trim();
+    if (rawName == null || rawName.isEmpty) return null;
+
+    Uri? uri;
+    try {
+      uri = Uri.parse(rawName);
+    } catch (_) {
+      return null;
+    }
+
+    final appsFlyerRoute = _generateAppsFlyerFallbackRoute(uri);
+    if (appsFlyerRoute != null) {
+      return appsFlyerRoute;
+    }
+
+    final routeParts = <String>[
+      if (uri.scheme != 'http' && uri.scheme != 'https' && uri.host.isNotEmpty)
+        uri.host,
+      ...uri.pathSegments,
+    ].where((part) => part.trim().isNotEmpty).toList(growable: false);
+
+    if (routeParts.isEmpty && uri.host.isNotEmpty) {
+      if (uri.host == 'wallet') {
+        return MaterialPageRoute(builder: (_) => const WalletScreen());
+      }
+      return null;
+    }
+
+    final queryRestaurantId = _parseRestaurantId(
+      uri.queryParameters['restaurantId'] ??
+          uri.queryParameters['restaurant_id'] ??
+          uri.queryParameters['id'],
+    );
+    final queryMenuItemId = _parseMenuItemId(
+      uri.queryParameters['menuItemId'] ??
+          uri.queryParameters['menu_item_id'] ??
+          uri.queryParameters['item_id'],
+    );
+
+    if (queryRestaurantId != null &&
+        (uri.queryParameters['screen'] == 'restaurant_detail' ||
+            routeParts.contains('restaurant') ||
+            routeParts.contains('restaurants'))) {
+      return MaterialPageRoute(
+        builder: (_) => RestaurantDetailScreen(
+          restaurantId: queryRestaurantId,
+          initialMenuItemId: queryMenuItemId,
+        ),
+      );
+    }
+
+    if (routeParts.length >= 2 &&
+        (routeParts.first == 'orders' || routeParts.first == 'order')) {
+      final orderId = int.tryParse(routeParts[1]);
+      if (orderId != null) {
+        return MaterialPageRoute(
+          builder: (_) => OrderTrackingScreen(orderId: orderId),
+        );
+      }
+    }
+
+    if (routeParts.length >= 2 &&
+        (routeParts.first == 'restaurants' ||
+            routeParts.first == 'restaurant')) {
+      final restaurantId = int.tryParse(routeParts[1]);
+      if (restaurantId != null) {
+        return MaterialPageRoute(
+          builder: (_) => RestaurantDetailScreen(
+            restaurantId: restaurantId,
+            initialMenuItemId: queryMenuItemId,
+          ),
+        );
+      }
+    }
+
+    if (routeParts.isNotEmpty && routeParts.first == 'wallet') {
+      return MaterialPageRoute(builder: (_) => const WalletScreen());
+    }
+
+    if (routeParts.isNotEmpty &&
+        (routeParts.first == 'referral' || routeParts.first == 'invite')) {
+      _storePendingReferralCode(
+        uri.queryParameters['code'] ?? uri.queryParameters['referral_code'],
+      );
+      return MaterialPageRoute(builder: (_) => const HomeScreen());
+    }
+
+    return null;
+  }
+
+  Route<dynamic>? _generateAppsFlyerFallbackRoute(Uri uri) {
+    final params = uri.queryParameters;
+    final hasAppsFlyerParams = params.containsKey('af_deeplink') ||
+        params.containsKey('af_dp') ||
+        params.containsKey('deep_link_value') ||
+        params.containsKey('deep_link_sub1') ||
+        params.containsKey('referral_code');
+    if (!hasAppsFlyerParams) return null;
+
+    final appDeepLink =
+        params['af_dp'] ?? params['deep_link'] ?? params['link'];
+    if (appDeepLink != null && appDeepLink.trim().isNotEmpty) {
+      final nestedRoute = _generateDeepLinkRoute(
+        RouteSettings(name: appDeepLink.trim()),
+      );
+      if (nestedRoute != null) return nestedRoute;
+    }
+
+    final screen =
+        (params['deep_link_value'] ?? params['screen'] ?? params['type'])
+            ?.toLowerCase();
+    final primaryRaw = params['deep_link_sub1'] ??
+        params['referral_code'] ??
+        params['code'] ??
+        '';
+    final primaryId = int.tryParse(primaryRaw);
+    final secondaryId = int.tryParse(params['deep_link_sub2'] ?? '');
+
+    if (screen == null &&
+        primaryRaw.trim().isNotEmpty &&
+        (params.containsKey('referral_code') || params.containsKey('code'))) {
+      _storePendingReferralCode(primaryRaw);
+      return MaterialPageRoute(builder: (_) => const HomeScreen());
+    }
+
+    switch (screen) {
+      case 'referral':
+      case 'invite':
+        _storePendingReferralCode(primaryRaw);
+        return MaterialPageRoute(builder: (_) => const HomeScreen());
+      case 'restaurant':
+      case 'branch':
+        if (primaryId != null && primaryId > 0) {
+          return MaterialPageRoute(
+            builder: (_) => RestaurantDetailScreen(restaurantId: primaryId),
+          );
+        }
+        break;
+      case 'product':
+      case 'menu_item':
+      case 'item':
+        if (primaryId != null &&
+            primaryId > 0 &&
+            secondaryId != null &&
+            secondaryId > 0) {
+          return MaterialPageRoute(
+            builder: (_) => RestaurantDetailScreen(
+              restaurantId: secondaryId,
+              initialMenuItemId: primaryId,
+            ),
+          );
+        }
+        break;
+    }
+
+    return MaterialPageRoute(builder: (_) => const HomeScreen());
+  }
+
+  void _storePendingReferralCode(String? rawCode) {
+    final code = rawCode?.trim();
+    if (code == null || code.isEmpty) return;
+    unawaited(
+      SharedPreferences.getInstance().then(
+        (prefs) => prefs.setString(
+          AppsFlyerDeepLinkService.pendingReferralCodeKey,
+          code,
+        ),
+      ),
+    );
+  }
+}

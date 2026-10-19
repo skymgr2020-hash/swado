@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- LaunchTheme (the Android 12+ native splash-screen styling) removed:
+         the Activity now launches directly on NormalTheme from values/styles.xml,
+         with no separate splash stage. -->
+</resources>

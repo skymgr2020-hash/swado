@@ -1,0 +1,37 @@
+/* =====================================================================
+ * BATCH 4f — restaurant app: AI assistant, menu analytics, invoices,
+ * notification test.  Paste the block below INSIDE the existing group:
+ *
+ *   Route::prefix('restaurant')
+ *       ->middleware('role:restaurant_owner,restaurant_staff')
+ *       ->group(function () {   //  routes/api.php  ~line 291
+ *           ... existing routes ...
+ *           <<< PASTE HERE >>>
+ *       });
+ *
+ * and add these imports at the top of routes/api.php:
+ *
+ *   use App\Http\Controllers\Api\Restaurant\RestaurantAssistantController;
+ *   use App\Http\Controllers\Api\Restaurant\MenuAnalyticsController;
+ *   use App\Http\Controllers\Api\Restaurant\RestaurantInvoicesController;
+ *   use App\Http\Controllers\Api\Restaurant\NotificationTestController;
+ * ===================================================================== */
+
+        // --- AI growth assistant (key + kill switch from admin AI Control Center) ---
+        Route::get('/assistant/status',  [RestaurantAssistantController::class, 'status']);
+        Route::get('/assistant/history', [RestaurantAssistantController::class, 'history'])
+            ->middleware('restaurant.permission:view_dashboard');
+        Route::post('/assistant/message', [RestaurantAssistantController::class, 'message'])
+            ->middleware(['restaurant.permission:view_dashboard', 'throttle:20,1']);
+
+        // --- Menu performance analysis (last 30 days + per-item AI suggestions) ---
+        Route::get('/menu/analytics', [MenuAnalyticsController::class, 'index'])
+            ->middleware('restaurant.permission:view_menu_items,manage_menu');
+
+        // --- Month-wise invoices / downloads ---
+        Route::get('/invoices', [RestaurantInvoicesController::class, 'index'])
+            ->middleware('restaurant.permission:view_reports,view_dashboard');
+
+        // --- Test order notification to this device ---
+        Route::post('/notifications/test', [NotificationTestController::class, 'send'])
+            ->middleware(['restaurant.permission:view_dashboard', 'throttle:6,1']);

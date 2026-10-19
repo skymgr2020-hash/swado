@@ -1,0 +1,1649 @@
+<?php
+
+namespace App\Http\Controllers\Api;
+
+use App\Events\NewOrderEvent;
+use App\Http\Controllers\Controller;
+use App\Models\AppSetting;
+use App\Models\Order;
+use App\Models\PaymentAttempt;
+use App\Models\Transaction;
+use App\Services\OrderReleaseService;
+use App\Services\OrderStatusPushService;
+use App\Services\PromotionRewardSettlementService;
+use App\Services\ScratchCardService;
+use App\Support\PhoneNumber;
+use App\Support\GatewayRegistry;
+use App\Support\JsonHttp;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
+use Stripe\PaymentIntent;
+use Stripe\Stripe;
+use Illuminate\Support\Str;
+
+class PaymentController extends Controller
+{
+    public function createPayment(Request $request)
+    {
+        $request->validate([
+            'order_id' => 'required|exists:orders,id',
+            'payment_method' => 'required|in:razorpay,stripe,cashfree,card,upi',
+            'gateway' => 'nullable|in:razorpay,stripe,cashfree',
+            'payment_gateway' => 'nullable|in:razorpay,stripe,cashfree',
+            'payment_gateway_provider' => 'nullable|in:razorpay,stripe,cashfree',
+        ]);
+
+        $order = Order::where('customer_id', auth()->id())
+            ->where('payment_status', 'pending')
+            ->findOrFail($request->order_id);
+
+        $paymentMethod = $this->resolveCustomerPaymentMethod($request, $request->payment_method);
+
+        $unavailable = $this->gatewayUnavailableResponse($paymentMethod);
+        if ($unavailable) {
+            return $unavailable;
+        }
+
+        if ($paymentMethod === 'razorpay') {
+            $key = AppSetting::getValue('razorpay_key', config('services.razorpay.key'));
+            $secret = AppSetting::getValue('razorpay_secret', config('services.razorpay.secret'));
+
+            if (! $key || ! $secret) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Razorpay is not configured.',
+                ], 503);
+            }
+
+            $orderData = [
+                'receipt' => 'order_' . $order->order_number,
+                'amount' => (int) round($order->total * 100),
+                'currency' => strtoupper(AppSetting::getValue('currency_code', 'INR') ?: 'INR'),
+                'payment_capture' => 1,
+            ];
+
+            $razorpayOrder = Http::withBasicAuth($key, $secret)
+                ->acceptJson()
+                ->asJson()
+                ->post('https://api.razorpay.com/v1/orders', $orderData);
+
+            if (! $razorpayOrder->successful()) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Unable to create Razorpay order.',
+                ], 502);
+            }
+
+            $razorpayOrder = $razorpayOrder->json();
+            $customerName = trim((string) ($request->input('customer_name') ?: $order->customer_name ?: $order->customer?->name ?: 'Customer'));
+            $customerEmail = trim((string) ($request->input('customer_email') ?: $order->customer?->email ?: ''));
+            $customerPhone = $this->cashfreeCustomerPhone($request->input('customer_phone') ?: $order->customer_phone ?: $order->customer?->phone);
+            return response()->json([
+                'success' => true,
+                'data' => [
+                    'payment_method' => 'razorpay',
+                    'order_id' => $razorpayOrder['id'],
+                    'amount' => $razorpayOrder['amount'],
+                    'currency' => $razorpayOrder['currency'],
+                    'key' => $key,
+                    'customer_name' => $customerName,
+                    'customer_email' => $customerEmail,
+                    'customer_phone' => $customerPhone,
+                    'phone' => $customerPhone,
+                    'contact' => $customerPhone,
+                    'prefill' => [
+                        'name' => $customerName,
+                        'email' => $customerEmail,
+                        'contact' => $customerPhone,
+                    ],
+                    'readonly' => [
+                        'contact' => true,
+                    ],
+                ],
+            ]);
+        }
+
+        if ($paymentMethod === 'stripe') {
+            $stripeSecret = AppSetting::getValue('stripe_secret', config('services.stripe.secret'));
+            $stripeKey = AppSetting::getValue('stripe_key', config('services.stripe.key'));
+
+            if (! $stripeSecret || ! $stripeKey) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Stripe is not configured.',
+                ], 503);
+            }
+
+            Stripe::setApiKey($stripeSecret);
+
+            $currency = strtolower(AppSetting::getValue('currency_code', 'INR') ?: 'INR');
+            $paymentIntent = PaymentIntent::create([
+                'amount' => (int) round($order->total * 100),
+                'currency' => $currency,
+                'metadata' => [
+                    'order_id' => $order->id,
+                    'order_number' => $order->order_number,
+                ],
+            ]);
+
+            return response()->json([
+                'success' => true,
+                'data' => [
+                    'payment_method' => 'stripe',
+                    'client_secret' => $paymentIntent->client_secret,
+                    'publishable_key' => $stripeKey,
+                ],
+            ]);
+        }
+
+        if ($paymentMethod === 'cashfree') {
+            $clientId = AppSetting::getValue('cashfree_client_id', AppSetting::getValue('cashfree_key', config('services.cashfree.client_id')));
+            $clientSecret = AppSetting::getValue('cashfree_client_secret', AppSetting::getValue('cashfree_secret', config('services.cashfree.client_secret')));
+            $apiVersion = config('services.cashfree.api_version', '2022-09-01');
+
+            if (! $clientId || ! $clientSecret) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Cashfree is not configured.',
+                ], 503);
+            }
+
+            try {
+                // (float) cast + JsonHttp::post() -- see App\Support\JsonHttp:
+                // Cashfree rejects a bare-integer order_amount for a
+                // whole-rupee total, and separately on a server where
+                // serialize_precision isn't -1, a plain json_encode() can
+                // dump a float's full raw binary precision instead of a
+                // clean decimal, which Cashfree also rejects.
+                $cashfreeOrder = JsonHttp::post(Http::withHeaders([
+                    'x-api-version' => $apiVersion,
+                    'x-client-id' => $clientId,
+                    'x-client-secret' => $clientSecret,
+                ]), $this->cashfreeBaseUrl() . '/pg/orders', [
+                    'order_id' => 'ORDER_' . $order->id . '_' . time(),
+                    'order_amount' => (float) round($order->total, 2),
+                    'order_currency' => strtoupper(AppSetting::getValue('currency_code', 'INR') ?: 'INR'),
+                    'order_note' => 'Payment to ' . AppSetting::getValue('app_name', config('app.name')),
+                    'order_tags' => [
+                        'app_name' => AppSetting::getValue('app_name', config('app.name')),
+                    ],
+                    'customer_details' => [
+                        'customer_id' => 'CUST_' . $order->customer_id,
+                        'customer_email' => $order->customer->email ?? '',
+                        'customer_phone' => $order->customer_phone,
+                    ],
+                ]);
+
+                if ($cashfreeOrder->failed()) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Unable to create Cashfree order: ' . $cashfreeOrder->body(),
+                    ], 502);
+                }
+
+                $cashfreeOrderData = $cashfreeOrder->json();
+
+                return response()->json([
+                    'success' => true,
+                    'data' => [
+                        'payment_method' => 'cashfree',
+                        'order_id' => $cashfreeOrderData['order_id'] ?? null,
+                        'payment_session_id' => $cashfreeOrderData['payment_session_id'] ?? null,
+                        'order_token' => $cashfreeOrderData['order_token'] ?? null,
+                        'environment' => AppSetting::getValue('cashfree_mode', 'test') === 'test' ? 'sandbox' : 'production',
+                    ],
+                ]);
+            } catch (\Exception $e) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Cashfree error: ' . $e->getMessage(),
+                ], 502);
+            }
+        }
+
+        return response()->json([
+            'success' => false,
+            'message' => ucfirst($paymentMethod) . ' payments are not available in this app build.',
+        ], 400);
+    }
+
+    public function cancelPayment(Request $request)
+    {
+        $request->validate([
+            'order_id' => 'required|exists:orders,id',
+            'reason' => 'nullable|string|max:255',
+        ]);
+
+        $order = Order::where('customer_id', auth()->id())
+            ->where('payment_status', 'pending')
+            ->findOrFail($request->order_id);
+
+        if ($order->isVisibleToRestaurant() || $order->status !== 'pending') {
+            PaymentAttempt::where('order_id', $order->id)
+                ->whereIn('status', [PaymentAttempt::STATUS_PENDING, PaymentAttempt::STATUS_ACTIVE])
+                ->update(['status' => PaymentAttempt::STATUS_FAILED, 'updated_at' => now()]);
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Payment was not completed. The order remains active.',
+            ]);
+        }
+
+        $order->update([
+            'payment_status' => 'failed',
+            'status' => 'cancelled',
+            'cancellation_reason' => $request->input('reason', 'Payment cancelled before completion'),
+            'cancelled_at' => now(),
+            'cancelled_by_role' => 'customer',
+            'cancelled_by_name' => auth()->user()->name ?? 'Customer',
+        ]);
+
+        app(OrderStatusPushService::class)->notifyParticipants(
+            $order->fresh(['customer', 'restaurant', 'driver']),
+            "Your order #{$order->order_number} has been cancelled.",
+            ['customer', 'restaurant', 'driver'],
+            'customer'
+        );
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Payment cancelled and order closed.',
+        ]);
+    }
+
+    public function verifyPayment(Request $request)
+    {
+        $request->validate([
+            'order_id' => 'required|exists:orders,id',
+            'payment_id' => 'required|string',
+            'payment_method' => 'required|in:razorpay,stripe,cashfree,card,upi',
+            'gateway' => 'nullable|in:razorpay,stripe,cashfree',
+            'payment_gateway' => 'nullable|in:razorpay,stripe,cashfree',
+            'payment_gateway_provider' => 'nullable|in:razorpay,stripe,cashfree',
+            'razorpay_order_id' => 'required_if:payment_method,razorpay|string',
+            'razorpay_signature' => 'required_if:payment_method,razorpay|string',
+            'stripe_payment_intent_id' => 'required_if:payment_method,stripe|string',
+        ]);
+
+        $order = Order::where('customer_id', auth()->id())
+            ->findOrFail($request->order_id);
+
+        if ($order->payment_status === 'success') {
+            return response()->json([
+                'success' => true,
+                'message' => 'Payment already verified successfully',
+            ]);
+        }
+
+        $paymentMethod = $this->resolveCustomerPaymentMethod($request, $request->payment_method);
+
+        if ($paymentMethod === 'razorpay') {
+            $secret = AppSetting::getValue('razorpay_secret', config('services.razorpay.secret'));
+            if (! $secret) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Razorpay is not configured.',
+                ], 503);
+            }
+
+            $payload = $request->razorpay_order_id . '|' . $request->payment_id;
+            $expectedSignature = hash_hmac('sha256', $payload, $secret);
+            if (! $request->razorpay_signature || ! hash_equals($expectedSignature, $request->razorpay_signature)) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Payment signature verification failed.',
+                ], 422);
+            }
+        }
+
+        if ($paymentMethod === 'stripe') {
+            $stripeSecret = AppSetting::getValue('stripe_secret', config('services.stripe.secret'));
+            if (! $stripeSecret) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Stripe is not configured.',
+                ], 503);
+            }
+
+            Stripe::setApiKey($stripeSecret);
+
+            try {
+                $paymentIntent = PaymentIntent::retrieve($request->stripe_payment_intent_id);
+
+                // Verify the payment intent status
+                if ($paymentIntent->status !== 'succeeded') {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Payment was not successful. Status: ' . $paymentIntent->status,
+                    ], 422);
+                }
+
+                // Verify the amount matches
+                if ($paymentIntent->amount !== (int) round($order->total * 100)) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Payment amount does not match order total.',
+                    ], 422);
+                }
+            } catch (\Exception $e) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Unable to verify Stripe payment: ' . $e->getMessage(),
+                ], 422);
+            }
+        }
+
+        if ($paymentMethod === 'cashfree') {
+            $clientId = AppSetting::getValue('cashfree_client_id', AppSetting::getValue('cashfree_key', config('services.cashfree.client_id')));
+            $clientSecret = AppSetting::getValue('cashfree_client_secret', AppSetting::getValue('cashfree_secret', config('services.cashfree.client_secret')));
+            $apiVersion = config('services.cashfree.api_version', '2022-09-01');
+
+            if (! $clientId || ! $clientSecret) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Cashfree is not configured.',
+                ], 503);
+            }
+
+            $expectedPrefixes = [
+                'ORDER_' . $order->id . '_',
+                'COD_' . $order->id . '_',
+            ];
+            $matchesExpectedOrder = collect($expectedPrefixes)
+                ->contains(fn (string $prefix) => str_starts_with($request->payment_id, $prefix));
+            if (! $matchesExpectedOrder) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Cashfree order does not match this checkout.',
+                ], 422);
+            }
+
+            try {
+                $response = null;
+                $cashfreeOrder = [];
+                for ($attempt = 0; $attempt < 4; $attempt++) {
+                    $response = Http::withHeaders([
+                        'x-api-version' => $apiVersion,
+                        'x-client-id' => $clientId,
+                        'x-client-secret' => $clientSecret,
+                    ])->get($this->cashfreeBaseUrl() . '/pg/orders/' . $request->payment_id);
+
+                    if ($response->successful()) {
+                        $cashfreeOrder = $response->json();
+                        if (strtoupper((string) ($cashfreeOrder['order_status'] ?? '')) === 'PAID') {
+                            break;
+                        }
+                    }
+
+                    if ($attempt < 3) {
+                        usleep(750000);
+                    }
+                }
+
+                if (! $response || $response->failed()) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Unable to verify Cashfree payment.',
+                    ], 422);
+                }
+
+                $cashfreeStatus = strtoupper((string) ($cashfreeOrder['order_status'] ?? 'UNKNOWN'));
+                if ($cashfreeStatus !== 'PAID') {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Cashfree payment is not confirmed yet. Status: ' . $cashfreeStatus . '.',
+                    ], 422);
+                }
+
+                $paymentsResponse = Http::withHeaders([
+                    'x-api-version' => $apiVersion,
+                    'x-client-id' => $clientId,
+                    'x-client-secret' => $clientSecret,
+                ])->get($this->cashfreeBaseUrl() . '/pg/orders/' . $request->payment_id . '/payments');
+                $payments = $paymentsResponse->successful() ? $paymentsResponse->json() : [];
+                if (isset($payments['payments'])) {
+                    $payments = $payments['payments'];
+                }
+                $successfulPayment = collect($payments)->first(
+                    fn ($payment) => strtoupper((string) ($payment['payment_status'] ?? '')) === 'SUCCESS'
+                );
+
+                $reportedAmount = $successfulPayment['payment_amount']
+                    ?? $cashfreeOrder['order_amount']
+                    ?? null;
+                if ($reportedAmount === null) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Cashfree did not return the paid amount for verification.',
+                    ], 422);
+                }
+
+                $paidMinor = (int) round(((float) $reportedAmount) * 100);
+                $expectedMinor = (int) round(((float) $order->total) * 100);
+                if ($paidMinor !== $expectedMinor) {
+                    \Log::warning('Cashfree paid amount mismatch', [
+                        'order_id' => $order->id,
+                        'cashfree_order_id' => $request->payment_id,
+                        'paid_amount' => $reportedAmount,
+                        'expected_amount' => $order->total,
+                    ]);
+                }
+
+                if ($successfulPayment) {
+                    $request->merge(['payment_id' => $successfulPayment['cf_payment_id'] ?? $request->payment_id]);
+                }
+            } catch (\Exception $e) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Cashfree verification error: ' . $e->getMessage(),
+                ], 422);
+            }
+        }
+
+        $attempt = PaymentAttempt::where('order_id', $order->id)
+            ->where('gateway', $paymentMethod)
+            ->whereIn('status', [PaymentAttempt::STATUS_PENDING, PaymentAttempt::STATUS_ACTIVE])
+            ->latest()
+            ->first();
+
+        if ($attempt) {
+            $attempt->forceFill([
+                'status' => PaymentAttempt::STATUS_SUCCESS,
+                'transaction_id' => $request->payment_id,
+                'paid_at' => now(),
+            ])->save();
+
+            PaymentAttempt::where('order_id', $order->id)
+                ->whereKeyNot($attempt->id)
+                ->whereIn('status', [PaymentAttempt::STATUS_PENDING, PaymentAttempt::STATUS_ACTIVE])
+                ->update(['status' => PaymentAttempt::STATUS_CANCELLED, 'updated_at' => now()]);
+        }
+
+        $order->update([
+            'payment_status' => 'success',
+            'payment_id' => $request->payment_id,
+            'payment_method' => $paymentMethod,
+            'payment_gateway' => $paymentMethod,
+            'payment_source' => PaymentAttempt::SOURCE_CUSTOMER_APP,
+            'paid_at' => now(),
+            'online_payment_verified_at' => now(),
+        ]);
+
+        Transaction::firstOrCreate(
+            [
+                'order_id' => $order->id,
+                'transaction_id' => $request->payment_id,
+            ],
+            [
+                'user_id' => auth()->id(),
+                'amount' => $order->total,
+                'type' => 'payment',
+                'status' => 'success',
+                'payment_method' => $paymentMethod,
+            ]
+        );
+
+        $order = $order->fresh(['customer', 'restaurant.owner', 'driver']);
+        app(OrderReleaseService::class)->releaseToRestaurant($order);
+        app(ScratchCardService::class)->issueForRecordedUsage($order);
+        app(PromotionRewardSettlementService::class)->settleForOrder($order, 'payment_success');
+
+        $statusPush = app(OrderStatusPushService::class);
+        $statusPush->notifyCustomer(
+            $order,
+            "Payment confirmed. Your order #{$order->order_number} has been placed successfully."
+        );
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Payment verified successfully',
+        ]);
+    }
+
+    public function createCheckoutPayment(Request $request)
+    {
+        $this->validateCheckoutPaymentRequest($request);
+
+        $paymentMethod = strtolower((string) $request->payment_method);
+        if (! in_array($paymentMethod, ['razorpay', 'stripe', 'cashfree'], true)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Choose Razorpay, Cashfree, or Stripe for online payment.',
+            ], 422);
+        }
+
+        $unavailable = $this->gatewayUnavailableResponse($paymentMethod);
+        if ($unavailable) {
+            return $unavailable;
+        }
+
+        $summaryResponse = app(OrderController::class)->summary($request);
+        $summaryPayload = $summaryResponse->getData(true);
+        if ($summaryResponse->getStatusCode() >= 400 || ($summaryPayload['success'] ?? false) !== true) {
+            return $summaryResponse;
+        }
+
+        $summary = $summaryPayload['data'] ?? [];
+        $amount = round((float) ($summary['total'] ?? 0), 2);
+        if ($amount <= 0) {
+            return response()->json([
+                'success' => false,
+                'message' => 'This checkout does not require an online payment.',
+            ], 422);
+        }
+
+        $currency = strtoupper(AppSetting::getValue('currency_code', 'INR') ?: 'INR');
+        $token = (string) Str::uuid();
+        $orderPayload = $request->only([
+            'restaurant_id',
+            'items',
+            'order_type',
+            'delivery_address_id',
+            'delivery_address',
+            'delivery_lat',
+            'delivery_lng',
+            'customer_name',
+            'customer_phone',
+            'coupon_code',
+            'special_instructions',
+            'scheduled_time',
+        ]);
+        $orderPayload['payment_method'] = $paymentMethod;
+
+        if ($paymentMethod === 'razorpay') {
+            $created = $this->createRazorpayCheckoutPayment($token, $amount, $currency, $request);
+        } elseif ($paymentMethod === 'cashfree') {
+            $created = $this->createCashfreeCheckoutPayment($token, $amount, $currency, $request);
+        } else {
+            $created = $this->createStripeCheckoutPayment($token, $amount, $currency);
+        }
+
+        Cache::put($this->checkoutPaymentCacheKey($token), [
+            'user_id' => $request->user()->id,
+            'payment_method' => $paymentMethod,
+            'amount' => $amount,
+            'currency' => $currency,
+            'gateway_reference' => $created['gateway_reference'],
+            'order_payload' => $orderPayload,
+            'summary' => $summary,
+            'created_at' => now()->toIso8601String(),
+        ], now()->addMinutes(20));
+
+        return response()->json([
+            'success' => true,
+            'data' => array_merge($created['client'], [
+                'checkout_payment_token' => $token,
+                'gateway' => $paymentMethod,
+                'amount' => $amount,
+                'amount_minor' => (int) round($amount * 100),
+                'currency' => $currency,
+            ]),
+        ]);
+    }
+
+    public function verifyCheckoutPayment(Request $request)
+    {
+        $validated = $request->validate([
+            'checkout_payment_token' => 'required|string',
+            'payment_method' => 'required|in:razorpay,stripe,cashfree',
+            'payment_id' => 'required|string',
+            'razorpay_order_id' => 'required_if:payment_method,razorpay|string',
+            'razorpay_signature' => 'required_if:payment_method,razorpay|string',
+            'stripe_payment_intent_id' => 'required_if:payment_method,stripe|string',
+        ]);
+
+        $token = $validated['checkout_payment_token'];
+        $cacheKey = $this->checkoutPaymentCacheKey($token);
+        $checkout = Cache::get($cacheKey);
+        if (! is_array($checkout)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Payment session expired. Please try again.',
+            ], 422);
+        }
+
+        $paymentMethod = strtolower((string) $validated['payment_method']);
+        if ((int) ($checkout['user_id'] ?? 0) !== (int) $request->user()->id
+            || ($checkout['payment_method'] ?? null) !== $paymentMethod) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Payment session does not match this checkout.',
+            ], 403);
+        }
+
+        $lockKey = $this->checkoutPaymentCacheKey($token) . ':lock';
+        if (! Cache::add($lockKey, '1', now()->addSeconds(60))) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Payment verification is already in progress.',
+            ], 409);
+        }
+
+        try {
+            $verification = match ($paymentMethod) {
+                'razorpay' => $this->verifyRazorpayCheckoutPayment($request, $checkout),
+                'cashfree' => $this->verifyCashfreeCheckoutPayment($request, $checkout),
+                'stripe' => $this->verifyStripeCheckoutPayment($request, $checkout),
+            };
+
+            $response = $this->createOrderFromVerifiedCheckout(
+                $request,
+                $checkout,
+                $paymentMethod,
+                $verification
+            );
+
+            if ($response->getStatusCode() < 400) {
+                Cache::forget($cacheKey);
+            }
+
+            return $response;
+        } finally {
+            Cache::forget($lockKey);
+        }
+    }
+
+    private function resolveCustomerPaymentMethod(Request $request, ?string $requestedMethod = null): string
+    {
+        $requestedMethod = strtolower(trim((string) ($requestedMethod ?? $request->input('payment_method'))));
+        if (! in_array($requestedMethod, ['card', 'upi'], true)) {
+            return $requestedMethod;
+        }
+
+        $selectedGateway = strtolower(trim((string) (
+            $request->input('gateway')
+            ?: $request->input('payment_gateway')
+            ?: $request->input('payment_gateway_provider')
+        )));
+
+        if ($selectedGateway !== ''
+            && in_array($selectedGateway, $this->customerSelectablePaymentGatewayKeys(), true)) {
+            return $selectedGateway;
+        }
+
+        $configured = AppSetting::getValue('payment_gateway_provider', 'razorpay');
+
+        return $this->availableCustomerPaymentGateway($configured) ?? strtolower((string) $configured);
+    }
+    private function gatewayUnavailableResponse(string $paymentMethod)
+    {
+        if ($this->isCustomerPaymentGatewayEnabled($paymentMethod)) {
+            return null;
+        }
+
+        return response()->json([
+            'success' => false,
+            'message' => $this->customerPaymentGatewayUnavailableMessage($paymentMethod),
+        ], 422);
+    }
+
+    private function isCustomerPaymentGatewayEnabled(?string $gateway): bool
+    {
+        if (method_exists(GatewayRegistry::class, 'isCustomerPaymentGatewayEnabled')) {
+            return GatewayRegistry::isCustomerPaymentGatewayEnabled($gateway);
+        }
+
+        $gateway = strtolower(trim((string) $gateway));
+        if ($gateway === '' || ! filter_var(AppSetting::getValue('payment_gateway_enabled', '1'), FILTER_VALIDATE_BOOLEAN)) {
+            return false;
+        }
+
+        return in_array($gateway, $this->enabledCustomerPaymentGatewayKeys(), true);
+    }
+
+    private function customerPaymentGatewayUnavailableMessage(?string $gateway = null): string
+    {
+        if (method_exists(GatewayRegistry::class, 'customerPaymentGatewayUnavailableMessage')) {
+            return GatewayRegistry::customerPaymentGatewayUnavailableMessage($gateway);
+        }
+
+        if (! filter_var(AppSetting::getValue('payment_gateway_enabled', '1'), FILTER_VALIDATE_BOOLEAN)) {
+            return 'Online payment is not available right now.';
+        }
+
+        return $this->paymentProviderLabel($gateway) . ' is not enabled for customer payments right now.';
+    }
+    private function validateCheckoutPaymentRequest(Request $request): void
+    {
+        $request->validate([
+            'restaurant_id' => 'required|exists:restaurants,id',
+            'items' => 'required|array|min:1',
+            'items.*.id' => 'required|exists:menu_items,id',
+            'items.*.quantity' => 'required|integer|min:1',
+            'items.*.selected_variant' => 'nullable|array',
+            'items.*.selected_add_ons' => 'nullable|array',
+            'order_type' => 'nullable|in:delivery,takeaway',
+            'delivery_address_id' => 'nullable|exists:addresses,id',
+            'delivery_address' => 'nullable|string',
+            'delivery_lat' => 'nullable|numeric',
+            'delivery_lng' => 'nullable|numeric',
+            'payment_method' => 'required|in:razorpay,stripe,cashfree',
+            'customer_name' => 'nullable|string',
+            'customer_phone' => 'nullable|string',
+            'coupon_code' => 'nullable|string',
+            'special_instructions' => 'nullable|string|max:1000',
+            'scheduled_time' => 'nullable|date|after:now',
+        ]);
+    }
+
+    private function createRazorpayCheckoutPayment(string $token, float $amount, string $currency, Request $request): array
+    {
+        $key = AppSetting::getValue('razorpay_key', config('services.razorpay.key'));
+        $secret = AppSetting::getValue('razorpay_secret', config('services.razorpay.secret'));
+        if (! $key || ! $secret) {
+            abort(503, 'Razorpay is not configured.');
+        }
+
+        $response = Http::withBasicAuth($key, $secret)
+            ->acceptJson()
+            ->asJson()
+            ->post('https://api.razorpay.com/v1/orders', [
+                'receipt' => substr('checkout_' . str_replace('-', '', $token), 0, 40),
+                'amount' => (int) round($amount * 100),
+                'currency' => $currency,
+                'payment_capture' => 1,
+                'notes' => [
+                    'checkout_payment_token' => $token,
+                    'user_id' => (string) $request->user()->id,
+                    'source' => PaymentAttempt::SOURCE_CUSTOMER_APP,
+                ],
+            ]);
+
+        if (! $response->successful()) {
+            abort(502, 'Unable to create Razorpay payment.');
+        }
+
+        $payload = $response->json() ?: [];
+        $customerName = trim((string) ($request->input('customer_name') ?: $request->user()->name ?: 'Customer'));
+        $customerEmail = trim((string) ($request->input('customer_email') ?: $request->input('email') ?: $request->user()->email ?: ''));
+        $customerPhone = $this->cashfreeCustomerPhone($request->input('customer_phone') ?: $request->input('phone') ?: $request->input('contact') ?: $request->user()->phone);
+        return [
+            'gateway_reference' => $payload['id'] ?? null,
+            'client' => [
+                'order_id' => $payload['id'] ?? null,
+                'amount' => $payload['amount'] ?? (int) round($amount * 100),
+                'amount_minor' => $payload['amount'] ?? (int) round($amount * 100),
+                'currency' => $payload['currency'] ?? $currency,
+                'key' => $key,
+                'customer_name' => $customerName,
+                'customer_email' => $customerEmail,
+                'customer_phone' => $customerPhone,
+                'phone' => $customerPhone,
+                'contact' => $customerPhone,
+                'prefill' => [
+                    'name' => $customerName,
+                    'email' => $customerEmail,
+                    'contact' => $customerPhone,
+                ],
+                'readonly' => [
+                    'contact' => true,
+                ],
+            ],
+        ];
+    }
+
+    private function createCashfreeCheckoutPayment(string $token, float $amount, string $currency, Request $request): array
+    {
+        $clientId = AppSetting::getValue('cashfree_client_id', AppSetting::getValue('cashfree_key', config('services.cashfree.client_id')));
+        $clientSecret = AppSetting::getValue('cashfree_client_secret', AppSetting::getValue('cashfree_secret', config('services.cashfree.client_secret')));
+        $apiVersion = config('services.cashfree.api_version', '2026-01-01');
+        if (! $clientId || ! $clientSecret) {
+            abort(503, 'Cashfree is not configured.');
+        }
+
+        $cashfreeOrderId = 'CHK_' . $request->user()->id . '_' . time() . '_' . Str::random(8);
+        $customerPhone = $this->cashfreeCustomerPhone($request->input('customer_phone') ?: $request->user()->phone);
+        $customerEmail = trim((string) ($request->user()->email ?? ''));
+        $customerName = trim((string) ($request->input('customer_name') ?: $request->user()->name ?: 'Customer'));
+        $customerDetails = [
+            'customer_id' => 'CUST_' . $request->user()->id,
+            'customer_phone' => $customerPhone,
+        ];
+        if ($customerEmail !== '' && filter_var($customerEmail, FILTER_VALIDATE_EMAIL)) {
+            $customerDetails['customer_email'] = $customerEmail;
+        }
+        if ($customerName !== '') {
+            $customerDetails['customer_name'] = $customerName;
+        }
+
+        // Must stay a genuine float (not int) -- Cashfree's create-order API
+        // rejects a bare integer order_amount ("invalid amount entered") for
+        // any whole-rupee total, and PHP's `int / int` division below
+        // silently returns an int when it divides evenly (100 becomes int
+        // 100, not float 100.0). See App\Support\JsonHttp for the matching
+        // JSON-encoding half of this fix.
+        $cashfreeAmount = (float) (((int) round($amount * 100)) / 100);
+        if ($cashfreeAmount < 1) {
+            abort(422, 'Cashfree requires a minimum order amount of INR 1.');
+        }
+
+        $requestPayload = [
+            'order_id' => $cashfreeOrderId,
+            'order_amount' => $cashfreeAmount,
+            'order_currency' => $currency,
+            'order_note' => 'Checkout payment for ' . AppSetting::getValue('app_name', config('app.name')),
+            'order_expiry_time' => now()->addMinutes(20)->toIso8601String(),
+            'order_tags' => [
+                'checkout_payment_token' => $token,
+                'user_id' => (string) $request->user()->id,
+                'source' => PaymentAttempt::SOURCE_CUSTOMER_APP,
+            ],
+            'customer_details' => $customerDetails,
+        ];
+
+        Log::info('Cashfree checkout order create request.', [
+            'mode' => AppSetting::getValue('cashfree_mode', 'test'),
+            'base_url' => $this->cashfreeBaseUrl(),
+            'api_version' => $apiVersion,
+            'order_id' => $cashfreeOrderId,
+            // number_format(), not the raw float -- Log::info()'s context
+            // array goes through PHP's own json_encode(), which (unlike the
+            // JsonHttp-encoded request body actually sent below) is at the
+            // mercy of the server's serialize_precision ini setting and can
+            // print a float's full raw IEEE-754 expansion instead of a clean
+            // decimal. Purely a log-readability issue -- the real request on
+            // the next line was never affected.
+            'amount' => number_format($cashfreeAmount, 2, '.', ''),
+            'amount_minor' => (int) round($cashfreeAmount * 100),
+            'currency' => $currency,
+            'client_id_suffix' => substr((string) $clientId, -6),
+        ]);
+
+        $response = JsonHttp::post(Http::withHeaders([
+            'x-api-version' => $apiVersion,
+            'x-client-id' => $clientId,
+            'x-client-secret' => $clientSecret,
+            'x-idempotency-key' => $token,
+        ])->acceptJson(), $this->cashfreeBaseUrl() . '/pg/orders', $requestPayload);
+
+        if (! $response->successful()) {
+            Log::warning('Cashfree checkout order creation failed.', [
+                'status' => $response->status(),
+                'response' => $response->json() ?: $response->body(),
+                'request' => array_merge($requestPayload, [
+                    // Same log-only float-precision cosmetic issue as the
+                    // request-create log above -- this echoes what was
+                    // built, not a re-send, so fixing it here is purely for
+                    // readability when debugging from this log entry.
+                    'order_amount' => number_format((float) $requestPayload['order_amount'], 2, '.', ''),
+                    'customer_details' => array_merge($customerDetails, [
+                        'customer_phone' => '***' . substr($customerPhone, -4),
+                    ]),
+                ]),
+            ]);
+
+            $body = $response->json() ?: [];
+            $message = $body['message']
+                ?? $body['error_description']
+                ?? $body['error']['message']
+                ?? $body['error']['description']
+                ?? 'Unable to create Cashfree payment.';
+            $status = in_array($response->status(), [400, 422], true) ? 422 : 502;
+            abort($status, $this->cashfreeCreateOrderFailureMessage($message, $cashfreeAmount, $currency));
+        }
+
+        $payload = $response->json() ?: [];
+        if (empty($payload['payment_session_id'])) {
+            Log::warning('Cashfree checkout order response missing payment_session_id.', [
+                'cashfree_order_id' => $cashfreeOrderId,
+                'response' => $payload,
+            ]);
+            abort(502, 'Cashfree did not return a payment session.');
+        }
+
+        return [
+            'gateway_reference' => $payload['order_id'] ?? $cashfreeOrderId,
+            'client' => [
+                'order_id' => $payload['order_id'] ?? $cashfreeOrderId,
+                'payment_session_id' => $payload['payment_session_id'] ?? null,
+                'paymentSessionId' => $payload['payment_session_id'] ?? null,
+                'payment_session_token' => $payload['payment_session_id'] ?? null,
+                'order_token' => $payload['order_token'] ?? null,
+                'payment_url' => $payload['payment_link'] ?? null,
+                'environment' => AppSetting::getValue('cashfree_mode', 'test') === 'test' ? 'sandbox' : 'production',
+            ],
+        ];
+    }
+
+
+    private function cashfreeCreateOrderFailureMessage(string $message, float $amount, string $currency): string
+    {
+        $normalized = strtolower($message);
+        if (str_contains($normalized, 'maximum limit') || str_contains($normalized, 'max limit')) {
+            return sprintf(
+                'Cashfree rejected %s %.2f because this Merchant ID has a lower maximum transaction limit. Increase the Cashfree MID limit in the Cashfree dashboard/support, or test with an amount within that limit.',
+                strtoupper($currency),
+                $amount
+            );
+        }
+
+        if (str_contains($normalized, 'order amount')) {
+            return sprintf('Cashfree rejected order amount %s %.2f: %s', strtoupper($currency), $amount, $message);
+        }
+
+        return 'Unable to create Cashfree payment: ' . $message;
+    }
+    private function createStripeCheckoutPayment(string $token, float $amount, string $currency): array
+    {
+        $stripeSecret = AppSetting::getValue('stripe_secret', config('services.stripe.secret'));
+        $stripeKey = AppSetting::getValue('stripe_key', config('services.stripe.key'));
+        if (! $stripeSecret || ! $stripeKey) {
+            abort(503, 'Stripe is not configured.');
+        }
+
+        Stripe::setApiKey($stripeSecret);
+        $intent = PaymentIntent::create([
+            'amount' => (int) round($amount * 100),
+            'currency' => strtolower($currency),
+            'automatic_payment_methods' => [
+                'enabled' => true,
+            ],
+            'metadata' => [
+                'checkout_payment_token' => $token,
+            ],
+        ]);
+
+        return [
+            'gateway_reference' => $intent->id,
+            'client' => [
+                'client_secret' => $intent->client_secret,
+                'publishable_key' => $stripeKey,
+            ],
+        ];
+    }
+
+    private function verifyRazorpayCheckoutPayment(Request $request, array $checkout): array
+    {
+        if ($request->razorpay_order_id !== ($checkout['gateway_reference'] ?? null)) {
+            abort(422, 'Razorpay order does not match this checkout.');
+        }
+
+        $secret = AppSetting::getValue('razorpay_secret', config('services.razorpay.secret'));
+        if (! $secret) {
+            abort(503, 'Razorpay is not configured.');
+        }
+
+        $expected = hash_hmac('sha256', $request->razorpay_order_id . '|' . $request->payment_id, $secret);
+        if (! hash_equals($expected, (string) $request->razorpay_signature)) {
+            abort(422, 'Payment signature verification failed.');
+        }
+
+        return [
+            'payment_id' => $request->payment_id,
+            'gateway_reference' => $request->razorpay_order_id,
+            'payload' => [
+                'razorpay_order_id' => $request->razorpay_order_id,
+                'razorpay_signature' => $request->razorpay_signature,
+            ],
+        ];
+    }
+
+    private function verifyCashfreeCheckoutPayment(Request $request, array $checkout): array
+    {
+        $cashfreeOrderId = (string) $request->payment_id;
+        if ($cashfreeOrderId !== (string) ($checkout['gateway_reference'] ?? '')) {
+            abort(422, 'Cashfree order does not match this checkout.');
+        }
+
+        $clientId = AppSetting::getValue('cashfree_client_id', AppSetting::getValue('cashfree_key', config('services.cashfree.client_id')));
+        $clientSecret = AppSetting::getValue('cashfree_client_secret', AppSetting::getValue('cashfree_secret', config('services.cashfree.client_secret')));
+        $apiVersion = config('services.cashfree.api_version', '2026-01-01');
+        if (! $clientId || ! $clientSecret) {
+            abort(503, 'Cashfree is not configured.');
+        }
+
+        $headers = [
+            'x-api-version' => $apiVersion,
+            'x-client-id' => $clientId,
+            'x-client-secret' => $clientSecret,
+        ];
+
+        // A UPI intent hand-off often returns control to the app before
+        // Cashfree has finished marking the order PAID server-side. The web
+        // checkout (CheckoutController::verifyGatewayPayment) already
+        // retries 4 times, 750ms apart, for exactly this race -- this path
+        // used to check once and abort, which is why a payment that
+        // genuinely succeeded could still come back "not confirmed yet" for
+        // app users specifically (UPI intent hand-off is app-only; web's
+        // checkout is a modal, no app switch).
+        $orderResponse = null;
+        $cashfreeOrder = [];
+        for ($attempt = 0; $attempt < 4; $attempt++) {
+            $orderResponse = Http::withHeaders($headers)->get($this->cashfreeBaseUrl() . '/pg/orders/' . $cashfreeOrderId);
+
+            if ($orderResponse->successful()) {
+                $cashfreeOrder = $orderResponse->json() ?: [];
+                if (strtoupper((string) ($cashfreeOrder['order_status'] ?? '')) === 'PAID') {
+                    break;
+                }
+            }
+
+            if ($attempt < 3) {
+                usleep(750000);
+            }
+        }
+
+        if (! $orderResponse || $orderResponse->failed()) {
+            abort(422, 'Unable to verify Cashfree payment.');
+        }
+
+        if (strtoupper((string) ($cashfreeOrder['order_status'] ?? '')) !== 'PAID') {
+            abort(422, 'Cashfree payment is not confirmed yet.');
+        }
+
+        $paymentsResponse = Http::withHeaders($headers)->get($this->cashfreeBaseUrl() . '/pg/orders/' . $cashfreeOrderId . '/payments');
+        $payments = $paymentsResponse->successful() ? ($paymentsResponse->json() ?: []) : [];
+        if (isset($payments['payments'])) {
+            $payments = $payments['payments'];
+        }
+        $successfulPayment = collect($payments)->first(
+            fn ($payment) => strtoupper((string) ($payment['payment_status'] ?? '')) === 'SUCCESS'
+        );
+
+        $reportedAmount = $successfulPayment['payment_amount'] ?? $cashfreeOrder['order_amount'] ?? null;
+        if ($reportedAmount === null || round((float) $reportedAmount, 2) !== round((float) ($checkout['amount'] ?? 0), 2)) {
+            abort(422, 'Cashfree paid amount does not match checkout total.');
+        }
+
+        return [
+            'payment_id' => $successfulPayment['cf_payment_id'] ?? $cashfreeOrderId,
+            'gateway_reference' => $cashfreeOrderId,
+            'payload' => [
+                'order' => $cashfreeOrder,
+                'payment' => $successfulPayment,
+            ],
+        ];
+    }
+
+    private function verifyStripeCheckoutPayment(Request $request, array $checkout): array
+    {
+        if ($request->stripe_payment_intent_id !== ($checkout['gateway_reference'] ?? null)) {
+            abort(422, 'Stripe payment does not match this checkout.');
+        }
+
+        $stripeSecret = AppSetting::getValue('stripe_secret', config('services.stripe.secret'));
+        if (! $stripeSecret) {
+            abort(503, 'Stripe is not configured.');
+        }
+
+        Stripe::setApiKey($stripeSecret);
+        $paymentIntent = PaymentIntent::retrieve($request->stripe_payment_intent_id);
+        if ($paymentIntent->status !== 'succeeded') {
+            abort(422, 'Payment was not successful. Status: ' . $paymentIntent->status);
+        }
+        if ((int) $paymentIntent->amount !== (int) round(((float) ($checkout['amount'] ?? 0)) * 100)) {
+            abort(422, 'Payment amount does not match checkout total.');
+        }
+
+        return [
+            'payment_id' => $request->stripe_payment_intent_id,
+            'gateway_reference' => $request->stripe_payment_intent_id,
+            'payload' => [
+                'stripe_payment_intent_id' => $request->stripe_payment_intent_id,
+            ],
+        ];
+    }
+
+    private function createOrderFromVerifiedCheckout(Request $request, array $checkout, string $paymentMethod, array $verification)
+    {
+        $payload = $checkout['order_payload'] ?? [];
+        if (! is_array($payload)) {
+            abort(422, 'Payment session is missing checkout details.');
+        }
+
+        $payload['payment_method'] = $paymentMethod;
+
+        // Reaching this point means the gateway has ALREADY confirmed and
+        // charged the payment (signature/status verified above) -- the
+        // customer's money is gone regardless of what happens next. If
+        // OrderController::store() fails (e.g. the transient
+        // "SQLSTATE[HY000] [2002] No such file or directory" dropped-
+        // connection error seen in production logs, which clears up on the
+        // very next DB connection attempt), the old code returned that
+        // failure straight to the app with no retry: the customer saw
+        // "payment failed" despite being charged, and no order existed to
+        // show for it.
+        //
+        // Note: store() catches its own exceptions internally (including
+        // QueryException) and RETURNS a JsonResponse rather than throwing
+        // -- so retrying must be driven by the response status, not a
+        // caught exception. Retrying is safe (not a double-order risk)
+        // because store() wraps everything in its own DB transaction and
+        // explicitly rolls back before returning that failure response, so
+        // a failed attempt creates nothing.
+        $maxAttempts = 3;
+        $response = null;
+
+        for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
+            $orderRequest = Request::create('/api/v1/orders', 'POST', $payload);
+            $orderRequest->setUserResolver(fn () => $request->user());
+            $orderRequest->attributes->set('confirmed_online_payment', [
+                'payment_method' => $paymentMethod,
+                'payment_id' => $verification['payment_id'],
+                'gateway_reference' => $verification['gateway_reference'] ?? null,
+                'payload' => $verification['payload'] ?? [],
+            ]);
+
+            if ($attempt > 1) {
+                // Force a fresh connection -- the one in the pool may still
+                // be the stale/dropped one that caused the previous
+                // attempt to fail.
+                DB::reconnect();
+            }
+
+            try {
+                $response = app(OrderController::class)->store($orderRequest);
+            } catch (\Throwable $e) {
+                // store() normally catches its own exceptions and returns a
+                // JsonResponse (handled below) -- but if the DB connection
+                // died badly enough that even its own rollback() call
+                // throws (a double-fault inside that catch block), the
+                // exception escapes uncaught instead. Treat that the same
+                // as a failed attempt rather than letting it propagate and
+                // skip the retry entirely.
+                Log::warning('Order creation threw uncaught after a confirmed payment -- retrying.', [
+                    'attempt' => $attempt,
+                    'max_attempts' => $maxAttempts,
+                    'payment_method' => $paymentMethod,
+                    'payment_id' => $verification['payment_id'] ?? null,
+                    'gateway_reference' => $verification['gateway_reference'] ?? null,
+                    'user_id' => $request->user()->id,
+                    'error' => $e->getMessage(),
+                ]);
+
+                if ($attempt < $maxAttempts) {
+                    usleep(300000 * $attempt);
+                }
+
+                continue;
+            }
+
+            if ($response->getStatusCode() < 500) {
+                // Either succeeded, or failed for a real (non-transient)
+                // reason -- e.g. validation, "restaurant closed" -- that a
+                // retry won't fix. Don't mask it with more attempts.
+                return $response;
+            }
+
+            Log::warning('Order creation failed after a confirmed payment -- retrying.', [
+                'attempt' => $attempt,
+                'max_attempts' => $maxAttempts,
+                'payment_method' => $paymentMethod,
+                'payment_id' => $verification['payment_id'] ?? null,
+                'gateway_reference' => $verification['gateway_reference'] ?? null,
+                'user_id' => $request->user()->id,
+                'response_body' => $response->getContent(),
+            ]);
+
+            if ($attempt < $maxAttempts) {
+                usleep(300000 * $attempt); // 300ms, 600ms
+            }
+        }
+
+        // All retries exhausted -- the payment is confirmed charged but no
+        // order could be created. This must never be a silent 500: log it
+        // at a level that pages/alerts, AND persist it (not just log it) so
+        // an admin can resolve it from a UI any time later -- the
+        // checkout_payment cache this replay relied on is only 20 minutes,
+        // long gone by the time anyone reacts to a log line.
+        Log::critical('CHARGED BUT NO ORDER: payment confirmed, order creation failed after all retries.', [
+            'payment_method' => $paymentMethod,
+            'payment_id' => $verification['payment_id'] ?? null,
+            'gateway_reference' => $verification['gateway_reference'] ?? null,
+            'user_id' => $request->user()->id,
+            'checkout_payload' => $payload,
+            'last_response_body' => $response?->getContent(),
+        ]);
+
+        try {
+            \App\Models\PaymentRecoveryQueue::create([
+                'user_id' => $request->user()->id,
+                'payment_method' => $paymentMethod,
+                'payment_id' => $verification['payment_id'] ?? null,
+                'gateway_reference' => $verification['gateway_reference'] ?? null,
+                'amount' => $checkout['amount'] ?? null,
+                'checkout_payload' => $payload,
+                'verification_payload' => $verification['payload'] ?? null,
+                'status' => 'pending',
+                'last_error' => $response?->getContent(),
+            ]);
+        } catch (\Throwable $e) {
+            // Don't let a failure to persist the recovery row turn into a
+            // worse error response than the one we're already building --
+            // the critical log above is the fallback of last resort.
+            Log::error('Failed to persist payment recovery queue row.', ['error' => $e->getMessage()]);
+        }
+
+        return response()->json([
+            'success' => false,
+            'message' => 'Your payment was received, but we could not place your order due to a temporary '
+                . 'system issue. Please contact support with this reference: ' . ($verification['payment_id'] ?? 'unknown')
+                . ' -- do not pay again.',
+        ], 500);
+    }
+
+    private function checkoutPaymentCacheKey(string $token): string
+    {
+        return 'checkout_payment:' . $token;
+    }
+
+    private function cashfreeCustomerPhone(?string $phone): string
+    {
+        $normalized = PhoneNumber::normalize(
+            $phone,
+            AppSetting::getValue('default_mobile_country_code', '+91')
+        );
+        $digits = preg_replace('/\D/', '', $normalized) ?: '';
+
+        if (strlen($digits) > 10 && str_starts_with($digits, '91')) {
+            $digits = substr($digits, -10);
+        }
+
+        if (strlen($digits) !== 10) {
+            abort(422, 'Enter a valid 10 digit mobile number for Cashfree payments.');
+        }
+
+        return $digits;
+    }
+
+    /**
+     * Creates a gateway payment session for an amount NOT yet tied to any
+     * existing `orders` row (used by Api\TheatreController's multi-stall
+     * checkout, which creates its own Order rows only after payment
+     * succeeds). Deliberately separate from createCheckoutPayment() above --
+     * that method is wired to Api\OrderController::summary() for a single-
+     * restaurant cart and creates its own gateway order/receipt IDs that do
+     * NOT satisfy verifyCheckoutPaymentForOrder()'s `APPCHK_{userId}_`
+     * prefix check below. This method's gateway references are built to
+     * match that check exactly, so any caller who creates a session here
+     * can later verify it via verifyCheckoutPaymentForOrder() unchanged.
+     */
+    public function createCheckoutPaymentSessionForOrder(Request $request, string $paymentMethod, float $amount, ?string $currency = null): array
+    {
+        $paymentMethod = strtolower($paymentMethod);
+        $currency = strtoupper($currency ?: (AppSetting::getValue('currency_code', 'INR') ?: 'INR'));
+        $reference = 'APPCHK_' . $request->user()->id . '_' . time() . '_' . Str::random(8);
+
+        if ($paymentMethod === 'razorpay') {
+            $key = AppSetting::getValue('razorpay_key', config('services.razorpay.key'));
+            $secret = AppSetting::getValue('razorpay_secret', config('services.razorpay.secret'));
+            if (! $key || ! $secret) {
+                throw new \RuntimeException('Razorpay is not configured.');
+            }
+
+            $response = Http::withBasicAuth($key, $secret)
+                ->acceptJson()
+                ->asJson()
+                ->post('https://api.razorpay.com/v1/orders', [
+                    'receipt' => substr($reference, 0, 40),
+                    'amount' => (int) round($amount * 100),
+                    'currency' => $currency,
+                    'payment_capture' => 1,
+                ]);
+
+            if (! $response->successful()) {
+                throw new \RuntimeException('Unable to create Razorpay payment.');
+            }
+
+            $payload = $response->json() ?: [];
+            $customerName = trim((string) ($request->input('customer_name') ?: $request->user()->name ?: 'Customer'));
+            $customerEmail = trim((string) ($request->input('customer_email') ?: $request->user()->email ?: ''));
+            $customerPhone = $this->cashfreeCustomerPhone($request->input('customer_phone') ?: $request->user()->phone);
+
+            return [
+                'order_id' => $payload['id'] ?? null,
+                'amount' => $payload['amount'] ?? (int) round($amount * 100),
+                'amount_minor' => $payload['amount'] ?? (int) round($amount * 100),
+                'currency' => $payload['currency'] ?? $currency,
+                'key' => $key,
+                'customer_name' => $customerName,
+                'customer_email' => $customerEmail,
+                'customer_phone' => $customerPhone,
+                'phone' => $customerPhone,
+                'contact' => $customerPhone,
+                'prefill' => [
+                    'name' => $customerName,
+                    'email' => $customerEmail,
+                    'contact' => $customerPhone,
+                ],
+                'readonly' => ['contact' => true],
+            ];
+        }
+
+        if ($paymentMethod === 'cashfree') {
+            $clientId = AppSetting::getValue('cashfree_client_id', AppSetting::getValue('cashfree_key', config('services.cashfree.client_id')));
+            $clientSecret = AppSetting::getValue('cashfree_client_secret', AppSetting::getValue('cashfree_secret', config('services.cashfree.client_secret')));
+            $apiVersion = config('services.cashfree.api_version', '2022-09-01');
+            if (! $clientId || ! $clientSecret) {
+                throw new \RuntimeException('Cashfree is not configured.');
+            }
+
+            $customerPhone = $this->cashfreeCustomerPhone($request->input('customer_phone') ?: $request->user()->phone);
+            $customerEmail = trim((string) ($request->user()->email ?? ''));
+            $customerName = trim((string) ($request->input('customer_name') ?: $request->user()->name ?: 'Customer'));
+            $customerDetails = [
+                'customer_id' => 'CUST_' . $request->user()->id,
+                'customer_phone' => $customerPhone,
+            ];
+            if ($customerEmail !== '' && filter_var($customerEmail, FILTER_VALIDATE_EMAIL)) {
+                $customerDetails['customer_email'] = $customerEmail;
+            }
+            if ($customerName !== '') {
+                $customerDetails['customer_name'] = $customerName;
+            }
+
+            // See the matching comment in createCashfreeCheckoutPayment() --
+            // must stay a genuine float or Cashfree rejects whole-rupee
+            // totals with "invalid amount entered".
+            $cashfreeAmount = (float) (((int) round($amount * 100)) / 100);
+            if ($cashfreeAmount < 1) {
+                throw new \RuntimeException('This order total is below Cashfree\'s minimum of ' . $currency . ' 1.');
+            }
+
+            $response = JsonHttp::post(Http::withHeaders([
+                'x-api-version' => $apiVersion,
+                'x-client-id' => $clientId,
+                'x-client-secret' => $clientSecret,
+                'x-idempotency-key' => $reference,
+            ])->acceptJson(), $this->cashfreeBaseUrl() . '/pg/orders', [
+                'order_id' => $reference,
+                'order_amount' => $cashfreeAmount,
+                'order_currency' => $currency,
+                'order_note' => 'Theatre checkout payment',
+                'order_expiry_time' => now()->addMinutes(20)->toIso8601String(),
+                'customer_details' => $customerDetails,
+            ]);
+
+            if (! $response->successful()) {
+                $body = $response->json() ?: [];
+                $message = $body['message'] ?? $body['error_description'] ?? 'Unable to create Cashfree payment.';
+                throw new \RuntimeException($message);
+            }
+
+            $payload = $response->json() ?: [];
+            if (empty($payload['payment_session_id'])) {
+                throw new \RuntimeException('Cashfree did not return a payment session.');
+            }
+
+            return [
+                'order_id' => $payload['order_id'] ?? $reference,
+                'payment_session_id' => $payload['payment_session_id'] ?? null,
+                'paymentSessionId' => $payload['payment_session_id'] ?? null,
+                'payment_session_token' => $payload['payment_session_id'] ?? null,
+                'order_token' => $payload['order_token'] ?? null,
+                'environment' => AppSetting::getValue('cashfree_mode', 'test') === 'test' ? 'sandbox' : 'production',
+            ];
+        }
+
+        if ($paymentMethod === 'stripe') {
+            $stripeSecret = AppSetting::getValue('stripe_secret', config('services.stripe.secret'));
+            $stripeKey = AppSetting::getValue('stripe_key', config('services.stripe.key'));
+            if (! $stripeSecret || ! $stripeKey) {
+                throw new \RuntimeException('Stripe is not configured.');
+            }
+
+            Stripe::setApiKey($stripeSecret);
+            $intent = PaymentIntent::create([
+                'amount' => (int) round($amount * 100),
+                'currency' => strtolower($currency),
+                'automatic_payment_methods' => ['enabled' => true],
+                'metadata' => [
+                    'customer_id' => (string) $request->user()->id,
+                ],
+            ]);
+
+            return [
+                'client_secret' => $intent->client_secret,
+                'publishable_key' => $stripeKey,
+            ];
+        }
+
+        throw new \RuntimeException('Unsupported payment gateway.');
+    }
+
+    public function verifyCheckoutPaymentForOrder(Request $request, string $paymentMethod, float $expectedAmount): string
+    {
+        $paymentMethod = strtolower($paymentMethod);
+        $expectedMinor = (int) round($expectedAmount * 100);
+
+        if ($paymentMethod === 'razorpay') {
+            $key = AppSetting::getValue('razorpay_key', config('services.razorpay.key'));
+            $secret = AppSetting::getValue('razorpay_secret', config('services.razorpay.secret'));
+            if (! $key || ! $secret) {
+                throw new \RuntimeException('Razorpay is not configured.');
+            }
+
+            $paymentId = (string) $request->input('payment_id', '');
+            $razorpayOrderId = (string) $request->input('razorpay_order_id', '');
+            $signature = (string) $request->input('razorpay_signature', '');
+            if ($paymentId === '' || $razorpayOrderId === '' || $signature === '') {
+                throw new \RuntimeException('Razorpay payment proof is missing.');
+            }
+
+            $expectedSignature = hash_hmac('sha256', $razorpayOrderId . '|' . $paymentId, $secret);
+            if (! hash_equals($expectedSignature, $signature)) {
+                throw new \RuntimeException('Payment signature verification failed.');
+            }
+
+            $response = Http::withBasicAuth($key, $secret)
+                ->acceptJson()
+                ->get('https://api.razorpay.com/v1/payments/' . $paymentId);
+            if (! $response->successful()) {
+                throw new \RuntimeException('Unable to verify Razorpay payment.');
+            }
+
+            $payment = $response->json();
+            if (($payment['order_id'] ?? null) !== $razorpayOrderId) {
+                throw new \RuntimeException('Razorpay order does not match this payment.');
+            }
+            if (($payment['status'] ?? null) !== 'captured') {
+                throw new \RuntimeException('Razorpay payment is not captured yet.');
+            }
+            if ((int) ($payment['amount'] ?? 0) !== $expectedMinor) {
+                throw new \RuntimeException('Payment amount does not match order total.');
+            }
+
+            $orderResponse = Http::withBasicAuth($key, $secret)
+                ->acceptJson()
+                ->get('https://api.razorpay.com/v1/orders/' . $razorpayOrderId);
+            $gatewayOrder = $orderResponse->successful() ? $orderResponse->json() : [];
+            $expectedReceiptPrefix = 'APPCHK_' . $request->user()->id . '_';
+            if (! str_starts_with((string) ($gatewayOrder['receipt'] ?? ''), $expectedReceiptPrefix)) {
+                throw new \RuntimeException('Razorpay order does not match this checkout.');
+            }
+
+            $this->ensureCheckoutPaymentUnused($paymentId);
+
+            return $paymentId;
+        }
+
+        if ($paymentMethod === 'stripe') {
+            $stripeSecret = AppSetting::getValue('stripe_secret', config('services.stripe.secret'));
+            if (! $stripeSecret) {
+                throw new \RuntimeException('Stripe is not configured.');
+            }
+
+            $intentId = (string) $request->input('stripe_payment_intent_id', $request->input('payment_id', ''));
+            if ($intentId === '') {
+                throw new \RuntimeException('Stripe payment proof is missing.');
+            }
+
+            Stripe::setApiKey($stripeSecret);
+            $intent = PaymentIntent::retrieve($intentId);
+            if ($intent->status !== 'succeeded') {
+                throw new \RuntimeException('Stripe payment was not successful. Status: ' . $intent->status);
+            }
+            if ((int) $intent->amount !== $expectedMinor) {
+                throw new \RuntimeException('Payment amount does not match order total.');
+            }
+            if ((string) ($intent->metadata->customer_id ?? '') !== (string) $request->user()->id) {
+                throw new \RuntimeException('Stripe payment does not match this checkout.');
+            }
+
+            $this->ensureCheckoutPaymentUnused($intentId);
+
+            return $intentId;
+        }
+
+        if ($paymentMethod === 'cashfree') {
+            $clientId = AppSetting::getValue('cashfree_client_id', AppSetting::getValue('cashfree_key', config('services.cashfree.client_id')));
+            $clientSecret = AppSetting::getValue('cashfree_client_secret', AppSetting::getValue('cashfree_secret', config('services.cashfree.client_secret')));
+            $apiVersion = config('services.cashfree.api_version', '2022-09-01');
+            if (! $clientId || ! $clientSecret) {
+                throw new \RuntimeException('Cashfree is not configured.');
+            }
+
+            $cashfreeOrderId = (string) $request->input('payment_id', '');
+            $expectedPrefix = 'APPCHK_' . $request->user()->id . '_';
+            if ($cashfreeOrderId === '' || ! str_starts_with($cashfreeOrderId, $expectedPrefix)) {
+                throw new \RuntimeException('Cashfree order does not match this checkout.');
+            }
+
+            $response = null;
+            $cashfreeOrder = [];
+            for ($attempt = 0; $attempt < 4; $attempt++) {
+                $response = Http::withHeaders([
+                    'x-api-version' => $apiVersion,
+                    'x-client-id' => $clientId,
+                    'x-client-secret' => $clientSecret,
+                ])->get($this->cashfreeBaseUrl() . '/pg/orders/' . $cashfreeOrderId);
+
+                if ($response->successful()) {
+                    $cashfreeOrder = $response->json();
+                    if (strtoupper((string) ($cashfreeOrder['order_status'] ?? 'UNKNOWN')) === 'PAID') {
+                        break;
+                    }
+                }
+
+                if ($attempt < 3) {
+                    usleep(750000);
+                }
+            }
+
+            if (! $response || $response->failed()) {
+                throw new \RuntimeException('Unable to verify Cashfree payment.');
+            }
+            if (strtoupper((string) ($cashfreeOrder['order_status'] ?? 'UNKNOWN')) !== 'PAID') {
+                throw new \RuntimeException('Cashfree payment is not confirmed yet.');
+            }
+
+            $paymentsResponse = Http::withHeaders([
+                'x-api-version' => $apiVersion,
+                'x-client-id' => $clientId,
+                'x-client-secret' => $clientSecret,
+            ])->get($this->cashfreeBaseUrl() . '/pg/orders/' . $cashfreeOrderId . '/payments');
+            $payments = $paymentsResponse->successful() ? $paymentsResponse->json() : [];
+            if (isset($payments['payments'])) {
+                $payments = $payments['payments'];
+            }
+            $successfulPayment = collect($payments)->first(
+                fn ($payment) => strtoupper((string) ($payment['payment_status'] ?? '')) === 'SUCCESS'
+            );
+            $reportedAmount = $successfulPayment['payment_amount'] ?? $cashfreeOrder['order_amount'] ?? null;
+            if ($reportedAmount === null || (int) round(((float) $reportedAmount) * 100) !== $expectedMinor) {
+                throw new \RuntimeException('Payment amount does not match order total.');
+            }
+
+            $transactionId = (string) ($successfulPayment['cf_payment_id'] ?? $cashfreeOrderId);
+            $this->ensureCheckoutPaymentUnused($transactionId);
+
+            return $transactionId;
+        }
+
+        throw new \RuntimeException('Unsupported payment gateway.');
+    }
+
+    private function ensureCheckoutPaymentUnused(string $transactionId): void
+    {
+        if ($transactionId === '') {
+            throw new \RuntimeException('Payment proof is missing.');
+        }
+
+        if (Order::where('payment_id', $transactionId)->exists()
+            || Transaction::where('transaction_id', $transactionId)->exists()) {
+            throw new \RuntimeException('This payment has already been used for an order.');
+        }
+    }
+
+    private function checkoutCustomerEmail(Request $request): string
+    {
+        $email = trim((string) ($request->input('customer_email') ?: $request->input('email') ?: $request->user()->email ?: ''));
+
+        return $email !== '' ? $email : 'customer' . $request->user()->id . '@foodflow.local';
+    }
+
+    private function checkoutCustomerPhone(Request $request): string
+    {
+        $phone = trim((string) ($request->input('customer_phone') ?: $request->input('phone') ?: $request->input('contact') ?: $request->user()->phone ?: ''));
+        $digits = preg_replace('/\D+/', '', $phone) ?: '';
+        if (strlen($digits) >= 10) {
+            return substr($digits, -10);
+        }
+
+        return $phone !== '' ? $phone : '9999999999';
+    }
+    private function cashfreeBaseUrl(): string
+    {
+        return AppSetting::getValue('cashfree_mode', 'test') === 'test'
+            ? 'https://sandbox.cashfree.com'
+            : 'https://api.cashfree.com';
+    }
+    private function availableCustomerPaymentGateway(?string $preferred = null): ?string
+    {
+        if (method_exists(GatewayRegistry::class, 'availableCustomerPaymentGateway')) {
+            return GatewayRegistry::availableCustomerPaymentGateway($preferred);
+        }
+
+        $enabled = $this->enabledCustomerPaymentGatewayKeys();
+        $preferred = strtolower(trim((string) $preferred));
+
+        if ($preferred !== '' && in_array($preferred, $enabled, true)) {
+            return $preferred;
+        }
+
+        return $enabled[0] ?? null;
+    }
+
+    private function enabledCustomerPaymentGatewayKeys(): array
+    {
+        $enabled = json_decode((string) AppSetting::getValue('enabled_payment_gateways', '[]'), true);
+        $supported = $this->customerSelectablePaymentGatewayKeys();
+
+        if (! is_array($enabled) || $enabled === []) {
+            return $supported;
+        }
+
+        return array_values(array_filter(
+            array_map(fn ($value) => strtolower(trim((string) $value)), $enabled),
+            fn ($value) => in_array($value, $supported, true)
+        ));
+    }
+
+    private function customerSelectablePaymentGatewayKeys(): array
+    {
+        if (method_exists(GatewayRegistry::class, 'customerSelectablePaymentProviders')) {
+            return array_keys(GatewayRegistry::customerSelectablePaymentProviders());
+        }
+
+        return ['razorpay', 'stripe', 'cashfree'];
+    }
+
+    private function paymentProviderLabel(?string $gateway): string
+    {
+        if (method_exists(GatewayRegistry::class, 'providerLabel')) {
+            return GatewayRegistry::providerLabel($gateway);
+        }
+
+        $labels = [
+            'razorpay' => 'Razorpay',
+            'stripe' => 'Stripe',
+            'cashfree' => 'Cashfree',
+        ];
+        $normalized = strtolower(trim((string) $gateway));
+
+        return $labels[$normalized] ?? ucfirst($normalized ?: 'gateway');
+    }
+}
